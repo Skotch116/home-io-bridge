@@ -1,7 +1,7 @@
 //! Timed Cast PLAY and the once-per-second drift loop for a calibrated speaker.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use rust_cast::channels::media::PlayerState;
@@ -20,6 +20,15 @@ const DRIFT_TICK: Duration = Duration::from_secs(1);
 const SPIN_TAIL: Duration = Duration::from_millis(1);
 /// When stream frame 0 is already due, how long to wait for PAUSED before sending PLAY.
 const PAUSED_GRACE: Duration = Duration::from_millis(500);
+/// Home.io Bridge: an error past `DRIFT_STEP_SECS` on this many drift ticks in a row is stepped by a re-LOAD
+/// (about a second of silence on that speaker, then in time) instead of slewed for many seconds.
+const STEP_AFTER_TICKS: u32 = 3;
+/// No second step sooner than this, and no more than `STEP_LIMIT` in one session: a speaker that is
+/// still off after that is off for a reason a step can't fix, and the slew is left to it.
+const STEP_SPACING: Duration = Duration::from_secs(20);
+const STEP_LIMIT: u32 = 3;
+
+type StepFn = Arc<dyn Fn() + Send + Sync>;
 
 /// Timing constants and timeline for one synced Cast session.
 pub(super) struct SyncAttach {
@@ -33,6 +42,9 @@ pub(super) struct SyncSession {
   pub(super) timeline: Arc<SyncTimeline>,
   pub(super) play_latency: Duration,
   pub(super) bias_ns: i64,
+  /// Home.io Bridge: the model and the owner's delay `bias_ns` was made with, to follow a change while playing.
+  pub(super) model: String,
+  pub(super) owner_ms: i64,
   pub(super) sample_rate: u32,
   /// Bumped after each accepted re-LOAD so the timed start runs again.
   pub(super) load_epoch: AtomicU64,
@@ -49,6 +61,16 @@ pub(super) struct SyncSession {
   session_alive: Arc<AtomicBool>,
   playback_paused: Arc<AtomicBool>,
   transport_flight: Arc<tokio::sync::Mutex<()>>,
+  /// Home.io Bridge: this model's learned start correction (`starts.txt`), added to `play_latency`.
+  learned_ms: AtomicI64,
+  /// The last timed PLAY went out on time and where it landed has not been measured yet.
+  start_clean: AtomicBool,
+  /// Home.io Bridge: asks the bridge to re-LOAD this session (set once the session is installed).
+  step: parking_lot::Mutex<Option<StepFn>>,
+  /// Drift ticks in a row with an error past the step threshold.
+  over: AtomicU32,
+  /// Steps asked for so far, and when the last one was.
+  stepped: parking_lot::Mutex<(u32, Option<Instant>)>,
 }
 
 impl std::fmt::Debug for SyncSession {
@@ -83,6 +105,8 @@ impl SyncSession {
       timeline: attach.timeline,
       play_latency: attach.params.play_latency,
       bias_ns: attach.params.bias_ns,
+      model: attach.params.model.clone(),
+      owner_ms: attach.params.owner_ms,
       sample_rate: sample_rate.max(1),
       load_epoch: AtomicU64::new(1),
       play_sent: AtomicBool::new(false),
@@ -92,7 +116,58 @@ impl SyncSession {
       session_alive,
       playback_paused,
       transport_flight,
+      learned_ms: AtomicI64::new(crate::audio::sync::learned_start_ms(&attach.params.model)),
+      start_clean: AtomicBool::new(false),
+      step: parking_lot::Mutex::new(None),
+      over: AtomicU32::new(0),
+      stepped: parking_lot::Mutex::new((0, None)),
     }
+  }
+
+  /// Where a clean timed start landed (`error_secs` on the first drift tick, before any correction):
+  /// most of it goes into this model's learned start, for the next start.
+  fn learn_start(&self, error_secs: f64) {
+    let limit = crate::audio::sync::LEARNED_START_LIMIT_MS;
+    let error_ms = error_secs * 1_000.0;
+    if !error_ms.is_finite() || error_ms.abs() > 400.0 {
+      return;
+    }
+    let was = self.learned_ms.load(Ordering::Acquire);
+    let now = (was + (error_ms * 0.7).round() as i64).clamp(-limit, limit);
+    tracing::info!(device = %self.device_id, model = %self.model, landed_ms = error_ms, was, now, "sync start landed; learned start updated");
+    if now != was {
+      self.learned_ms.store(now, Ordering::Release);
+      crate::audio::sync::set_learned_start_ms(&self.model, now);
+    }
+  }
+
+  pub(super) fn set_step(&self, step: StepFn) {
+    *self.step.lock() = Some(step);
+  }
+
+  /// Counts a tick whose error is past the step threshold; asks for a re-LOAD when enough came in a
+  /// row and the spacing and limit allow one. `true` when it asked.
+  fn step_if_due(&self, error_secs: f64) -> bool {
+    if error_secs.abs() <= crate::audio::sync::DRIFT_STEP_SECS {
+      self.over.store(0, Ordering::Release);
+      return false;
+    }
+    if self.over.fetch_add(1, Ordering::AcqRel) + 1 < STEP_AFTER_TICKS {
+      return false;
+    }
+    let step = {
+      let mut stepped = self.stepped.lock();
+      if stepped.0 >= STEP_LIMIT || stepped.1.is_some_and(|at| at.elapsed() < STEP_SPACING) {
+        return false;
+      }
+      *stepped = (stepped.0 + 1, Some(Instant::now()));
+      self.step.lock().clone()
+    };
+    let Some(step) = step else { return false };
+    self.over.store(0, Ordering::Release);
+    tracing::info!(device = %self.device_id, error_ms = error_secs * 1_000.0, "sync step: re-LOAD to land in time");
+    step();
+    true
   }
 
   fn alive(&self) -> bool {
@@ -150,7 +225,10 @@ async fn timed_start(sync: &SyncSession, epoch: u64) -> bool {
     let Some(d0) = wait_for_arm(sync, epoch).await else {
       return sync.alive() && !sync.epoch_is(epoch);
     };
-    let play_at = d0.checked_sub(sync.play_latency).unwrap_or(d0);
+    let learned = sync.learned_ms.load(Ordering::Acquire);
+    let shift = Duration::from_millis(learned.unsigned_abs());
+    let latency = if learned >= 0 { sync.play_latency + shift } else { sync.play_latency.saturating_sub(shift) };
+    let play_at = d0.checked_sub(latency).unwrap_or(d0);
     if !sleep_until_play(sync, epoch, play_at).await {
       return sync.alive() && !sync.epoch_is(epoch);
     }
@@ -291,6 +369,7 @@ async fn send_timed_play(sync: &SyncSession, epoch: u64, d0: Instant, play_at: I
     Ok(Ok(())) => {
       let ack_ms = sent.elapsed().as_secs_f64() * 1_000.0;
       sync.timeline.log_start(d0, sent, late_ms, ack_ms);
+      sync.start_clean.store(late_ms < 5.0, Ordering::Release);
       PlaySend::Sent
     },
     Ok(Err(err)) => {
@@ -352,6 +431,12 @@ async fn drift_tick(sync: &SyncSession, ema: Option<f64>) -> Option<f64> {
   }
   let current = status.current_time?;
   let sample = sample_error(sync, t, f64::from(current))?;
+  if ema.is_none() && sync.start_clean.swap(false, Ordering::AcqRel) {
+    sync.learn_start(sample.error);
+  }
+  if sync.step_if_due(sample.predicted) {
+    return None;
+  }
   let smoothed = smooth_ema(ema, sample.predicted);
   apply_drift(sync, smoothed);
   let request = match drift_action(smoothed, sync.sample_rate) {
@@ -380,7 +465,8 @@ struct SampleError {
 }
 
 fn sample_error(sync: &SyncSession, t: Instant, current_time: f64) -> Option<SampleError> {
-  let bias_secs = (sync.bias_ns as f64) / 1_000_000_000.0;
+  let moved_ms = crate::audio::sync::owner_delay_ms(&sync.model) - sync.owner_ms;
+  let bias_secs = ((sync.bias_ns - moved_ms.saturating_mul(1_000_000)) as f64) / 1_000_000_000.0;
   let s_aud = (current_time - bias_secs) * f64::from(sync.sample_rate);
   let due = sync.timeline.due_at(s_aud)?;
   let error = signed_secs(t, due);

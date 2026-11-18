@@ -13,6 +13,7 @@ pub mod cast;
 pub mod config;
 pub mod discover;
 pub mod error;
+mod homeio;
 pub mod media;
 pub mod names;
 pub mod net;

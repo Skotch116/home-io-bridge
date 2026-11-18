@@ -21,7 +21,9 @@ pub(crate) const DRIFT_STEP_SECS: f64 = 0.100;
 /// EMA weight of the newest predicted error.
 pub(crate) const DRIFT_EMA_ALPHA: f64 = 0.2;
 /// Largest nudge requested on one drift tick, in samples.
-const DRIFT_MAX_SAMPLES: f64 = 1000.0;
+/// Home.io Bridge: 300 (0.6 % speed), not 1000 (2 %): at 2 % the pitch audibly bends for as long as the
+/// correction lasts. Errors too big for this are stepped by a re-LOAD (see `bridge::sync`).
+const DRIFT_MAX_SAMPLES: f64 = 300.0;
 
 const NEST_AUDIO_MODEL: &str = "Nest Audio";
 const NEST_MINI_MODEL: &str = "Google Nest Mini";
@@ -47,6 +49,8 @@ pub(crate) struct ResolvedSync {
   pub(crate) play_latency: Duration,
   /// `currentTime` minus audible position, nanoseconds (positive: status runs ahead).
   pub(crate) bias_ns: i64,
+  /// Home.io Bridge: the owner's delay already inside the two numbers above, in ms.
+  pub(crate) owner_ms: i64,
 }
 
 /// Table lookup. `None` for a Cast group or any model that is not calibrated.
@@ -55,20 +59,131 @@ pub(crate) fn resolve_sync(model: &str) -> Option<ResolvedSync> {
     return None;
   }
   let (play_ms, status_bias_ms) = model_table(model)?;
+  let owner_ms = owner_delay_ms(model);
+  let (play_ms, status_bias_ms) = (play_ms - owner_ms, status_bias_ms - owner_ms);
   let play_latency = Duration::from_millis(u64::try_from(play_ms.max(0)).unwrap_or(0));
   Some(ResolvedSync {
     model: model.to_owned(),
     play_latency,
     bias_ns: status_bias_ms.saturating_mul(1_000_000),
+    owner_ms,
   })
 }
 
 fn model_table(model: &str) -> Option<(i64, i64)> {
-  match model {
-    NEST_AUDIO_MODEL => Some((NEST_AUDIO_PLAY_MS, NEST_AUDIO_BIAS_MS)),
-    NEST_MINI_MODEL => Some((NEST_MINI_PLAY_MS, NEST_MINI_BIAS_MS)),
-    _ => None,
+  let (play_ms, bias_ms) = match model {
+    NEST_AUDIO_MODEL => (NEST_AUDIO_PLAY_MS, NEST_AUDIO_BIAS_MS),
+    NEST_MINI_MODEL => (NEST_MINI_PLAY_MS, NEST_MINI_BIAS_MS),
+    // Home.io Bridge: the Nest Hub, not calibrated upstream. A first guess that sounded in step by ear.
+    "Google Nest Hub" => (290, 0),
+    _ => return None,
+  };
+  Some((play_ms, bias_ms))
+}
+
+/// Home.io Bridge: the owner's own shift for a model, in ms (positive plays the speaker later). Starting later means
+/// sending PLAY later; holding it later means the status position counts as that much further along. It is taken
+/// when a session starts and looked at again on every drift tick, so a change is heard within seconds.
+/// Lines of "model<TAB>ms" in `delays.txt`. 0 without a line for the model.
+pub(crate) fn owner_delay_ms(model: &str) -> i64 {
+  owner_delays().into_iter().find(|(name, _)| name == model).map_or(0, |(_, ms)| ms)
+}
+
+/// Home.io Bridge: writes one model's delay, clamped to 500 ms either way.
+pub(crate) fn set_owner_delay_ms(model: &str, ms: i64) -> std::io::Result<()> {
+  let Some(path) = delays_path() else {
+    return Err(std::io::Error::other("no folder for delays.txt"));
+  };
+  let mut all: Vec<(String, i64)> = owner_delays().into_iter().filter(|(name, _)| name != model).collect();
+  all.push((model.to_owned(), ms.clamp(-OWNER_DELAY_LIMIT_MS, OWNER_DELAY_LIMIT_MS)));
+  all.sort();
+  if let Some(folder) = path.parent() {
+    std::fs::create_dir_all(folder)?;
   }
+  let text: String = all.iter().map(|(name, ms)| format!("{name}\t{ms}\n")).collect();
+  std::fs::write(path, text)
+}
+
+/// Home.io Bridge: a model whose loudness does not follow the receiver volume an app can set, so its
+/// volume is set on the media stream. Seen on one Nest Hub (Nov 18 2026): it took and reported every
+/// receiver volume, muted too, and played on unchanged; its own buttons changed a volume apps never see.
+pub(crate) fn uses_stream_volume(model: &str) -> bool {
+  model == "Google Nest Hub"
+}
+
+/// Home.io Bridge: whether a model is one this engine keeps in time.
+pub(crate) fn is_calibrated(model: &str) -> bool {
+  model != CAST_GROUP_MODEL && model_table(model).is_some()
+}
+
+const OWNER_DELAY_LIMIT_MS: i64 = 500;
+
+/// `$HOMEIO_BRIDGE_DIR/delays.txt` (the Home Assistant add-on), else the Home.io Bridge app's folder on a Mac.
+fn delays_path() -> Option<std::path::PathBuf> {
+  bridge_file("delays.txt")
+}
+
+fn bridge_file(name: &str) -> Option<std::path::PathBuf> {
+  if let Some(folder) = std::env::var_os("HOMEIO_BRIDGE_DIR") {
+    return Some(std::path::Path::new(&folder).join(name));
+  }
+  let home = std::env::var_os("HOME")?;
+  Some(std::path::Path::new(&home).join("Library/Application Support/Home.io Bridge").join(name))
+}
+
+fn owner_delays() -> Vec<(String, i64)> {
+  model_lines(delays_path(), OWNER_DELAY_LIMIT_MS)
+}
+
+/// Lines of "model<TAB>ms", each clamped to `limit` either way.
+fn model_lines(path: Option<std::path::PathBuf>, limit: i64) -> Vec<(String, i64)> {
+  let Some(text) = path.and_then(|path| std::fs::read_to_string(path).ok()) else {
+    return Vec::new();
+  };
+  text
+    .lines()
+    .filter_map(|line| line.rsplit_once('\t'))
+    .filter_map(|(name, ms)| Some((name.to_owned(), ms.trim().parse::<i64>().ok()?)))
+    .map(|(name, ms)| (name, ms.clamp(-limit, limit)))
+    .collect()
+}
+
+/// Home.io Bridge: how far off the timed PLAY lands differs from one speaker model (and one home's
+/// network) to the next, and a start that lands off is then slewed in for many seconds, which is
+/// heard. So each clean start measures where it landed, and the next start for that model is sent
+/// that much earlier or later: lines of "model<TAB>ms" in `starts.txt`, added to the PLAY latency.
+pub(crate) const LEARNED_START_LIMIT_MS: i64 = 250;
+
+pub(crate) fn learned_start_ms(model: &str) -> i64 {
+  learned_start_from(model_lines(bridge_file("starts.txt"), LEARNED_START_LIMIT_MS), model)
+}
+
+fn learned_start_from(lines: Vec<(String, i64)>, model: &str) -> i64 {
+  lines.into_iter().find(|(name, _)| name == model).map_or_else(|| first_start_ms(model), |(_, ms)| ms)
+}
+
+/// Where learning begins for a model nothing has been learned for yet in this home, so the very first
+/// start already lands close. From clean starts in one home (Nov 18 2026): a Nest Hub settled between
+/// -72 and -120 on a Mac and on a Raspberry Pi 4, a Nest Mini at 15 on the Mac.
+fn first_start_ms(model: &str) -> i64 {
+  match model {
+    "Google Nest Hub" => -90,
+    NEST_MINI_MODEL => 10,
+    _ => 0,
+  }
+}
+
+pub(crate) fn set_learned_start_ms(model: &str, ms: i64) {
+  let Some(path) = bridge_file("starts.txt") else { return };
+  let mut all: Vec<(String, i64)> =
+    model_lines(Some(path.clone()), LEARNED_START_LIMIT_MS).into_iter().filter(|(name, _)| name != model).collect();
+  all.push((model.to_owned(), ms.clamp(-LEARNED_START_LIMIT_MS, LEARNED_START_LIMIT_MS)));
+  all.sort();
+  if let Some(folder) = path.parent() {
+    let _made = std::fs::create_dir_all(folder);
+  }
+  let text: String = all.iter().map(|(name, ms)| format!("{name}\t{ms}\n")).collect();
+  let _written = std::fs::write(path, text);
 }
 
 /// What one drift tick asks the encoder to do.
@@ -653,15 +768,15 @@ mod tests {
   #[test]
   fn drift_action_deadband_step_and_clamp() {
     assert_eq!(drift_action(0.001, 48_000), DriftAction::None);
-    assert_eq!(drift_action(0.15, 48_000), DriftAction::Adjust(1000));
-    assert_eq!(drift_action(-0.15, 48_000), DriftAction::Adjust(-1000));
+    assert_eq!(drift_action(0.15, 48_000), DriftAction::Adjust(300));
+    assert_eq!(drift_action(-0.15, 48_000), DriftAction::Adjust(-300));
     // 0.2 * 0.01 * 48000 = 96
     assert_eq!(drift_action(0.01, 48_000), DriftAction::Adjust(96));
     assert_eq!(drift_action(-0.01, 48_000), DriftAction::Adjust(-96));
-    // 0.2 * 0.05 * 48000 = 480, under the cap
-    assert_eq!(drift_action(0.05, 48_000), DriftAction::Adjust(480));
-    // 0.2 * 0.09 * 48000 = 864
-    assert_eq!(drift_action(0.09, 48_000), DriftAction::Adjust(864));
+    // 0.2 * 0.03 * 48000 = 288, under the cap
+    assert_eq!(drift_action(0.03, 48_000), DriftAction::Adjust(288));
+    // 0.2 * 0.09 * 48000 = 864, capped
+    assert_eq!(drift_action(0.09, 48_000), DriftAction::Adjust(300));
   }
 
   #[test]
@@ -703,6 +818,16 @@ mod tests {
     assert_eq!(timeline.pending_net(20.0), -1);
     assert_eq!(timeline.pending_net(9.0), 1);
     assert_eq!(timeline.applied_net(), 1);
+  }
+
+  #[test]
+  fn a_first_start_begins_from_the_models_own_value_until_one_is_learned() {
+    assert_eq!(learned_start_from(Vec::new(), "Google Nest Hub"), -90);
+    assert_eq!(learned_start_from(Vec::new(), NEST_MINI_MODEL), 10);
+    assert_eq!(learned_start_from(Vec::new(), NEST_AUDIO_MODEL), 0);
+    let learned = vec![("Google Nest Hub".to_owned(), -77)];
+    assert_eq!(learned_start_from(learned.clone(), "Google Nest Hub"), -77);
+    assert_eq!(learned_start_from(learned, NEST_MINI_MODEL), 10);
   }
 
   #[test]

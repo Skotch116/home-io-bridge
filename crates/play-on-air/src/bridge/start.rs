@@ -161,6 +161,12 @@ impl Bridge {
     // StartingGuard also clears on panic between accept and Playing install.
     // AirPlay multi-select: the first member to start owns the Cast session; the others
     // join it through Cast multizone instead of loading their own stream.
+    // Home.io Bridge: a speaker this engine keeps in time plays its own stream, timed to the AirPlay
+    // clock. Joined to another Google speaker through Cast multizone it follows Google's group clock
+    // instead, which nothing here can line up with the AirPlay speakers (heard: one to two seconds off).
+    let airplay_group = airplay_group.filter(|_| {
+      !self.registry.get(device_id).is_some_and(|device| crate::audio::sync::is_calibrated(&device.model))
+    });
     let (generation, prior, group, media_key) = if let Some(uuid) = airplay_group {
       match self.enter_group(device_id, &uuid, sample_rate, &ring) {
         GroupEntry::Following { prior } => {
@@ -522,6 +528,12 @@ impl Bridge {
         Arc::clone(&transport_flight),
       ))
     });
+
+    if let Some(sync) = &sync_session {
+      let bridge = Arc::clone(self);
+      let id = device_id.to_owned();
+      sync.set_step(Arc::new(move || bridge.spawn_reload_playing_media(&id, generation, "sync_step", None)));
+    }
 
     let (rollover_cancel, rollover_task) = if egress == EgressKind::WavBuffered {
       let (cancel, task) = spawn_rollover_reload_loop(

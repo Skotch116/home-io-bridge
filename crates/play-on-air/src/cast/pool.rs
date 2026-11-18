@@ -470,6 +470,8 @@ enum CastWorkerCmd {
     level: f32,
     reply: SyncSender<Result<()>>,
   },
+  /// Home.io Bridge: set the playing media stream's own volume.
+  SetStreamVolume { level: f32, reply: SyncSender<Result<()>> },
   /// Read receiver volume from `get_status` on the warm connection (linear `0.0..=1.0`).
   GetVolume { reply: SyncSender<Result<f32>> },
   /// Stop active media session (if any); keep TCP warm.
@@ -878,6 +880,17 @@ impl CastControl for CastPool {
     }
   }
 
+  fn set_stream_volume(&self, device_id: &str, level: f32) -> Result<()> {
+    let tx = self.cmd_tx(device_id)?;
+    let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+    tx.send(CastWorkerCmd::SetStreamVolume { level, reply: reply_tx })
+      .map_err(|_send| Error::Cast(format!("warm Cast worker for {device_id} disconnected")))?;
+    match reply_rx.recv_timeout(VOLUME_TIMEOUT) {
+      Ok(result) => result,
+      Err(_) => Err(Error::Cast(format!("warm Cast stream volume got no answer for {device_id}"))),
+    }
+  }
+
   /// Read current receiver volume on the warm connection (`0.0..=1.0`; muted → `0.0`).
   fn get_volume(&self, device_id: &str) -> Result<f32> {
     let tx = self.cmd_tx(device_id)?;
@@ -1106,6 +1119,8 @@ struct WorkerState {
   next_probe_at: Instant,
   /// Shared relay shutdown slot (pool `remove` force-closes).
   relay_slot: SharedRelaySlot,
+  /// Home.io Bridge: the media stream volume the owner last asked for (see `set_stream_volume`).
+  stream_level: Option<f32>,
   /// Last successful LOAD request (for internal re-LOAD recovery).
   last_load: Option<MediaLoadRequest>,
   /// When the last LOAD command was applied (rollover guard).
@@ -1180,6 +1195,7 @@ fn worker_main(
     remote: RemoteTracker::default(),
     next_probe_at: now,
     relay_slot,
+    stream_level: None,
     last_load: None,
     last_load_at: None,
     reload_attempted: false,
@@ -1311,6 +1327,10 @@ fn worker_main(
           let send_result = err_msg.as_ref().map_or(Ok(()), |msg| Err(Error::Cast(msg.clone())));
           drop(r.send(send_result));
         }
+      },
+      CastWorkerCmd::SetStreamVolume { level, reply } => {
+        state.handle_set_stream_volume(level);
+        drop(reply.send(Ok(())));
       },
       CastWorkerCmd::GetVolume { reply } => {
         let result = state.with_hard_deadline(WorkerState::handle_get_volume);
@@ -1503,6 +1523,39 @@ impl WorkerState {
       && tx.send(CastRemoteEvent { device_id: self.device_id.clone(), kind }).is_err()
     {
       tracing::debug!(device_id = %self.device_id, "remote-events channel closed");
+    }
+  }
+
+  /// Home.io Bridge: remember `level` as the stream's volume and apply it to the playing session.
+  fn handle_set_stream_volume(&mut self, level: f32) {
+    let level = volume_level_clamped(level);
+    self.stream_level = Some(level);
+    if let Some(session) = &self.active {
+      self.send_stream_volume(&session.transport_id, session.media_session_id, level);
+    }
+  }
+
+  /// Media-channel `SET_VOLUME`: the Default Media Receiver turns the stream itself down. A LOAD
+  /// starts every session at full, so each LOAD sends the remembered level again.
+  fn send_stream_volume(&self, transport_id: &str, media_session_id: i32, level: f32) {
+    let Some(device) = self.device.as_ref() else {
+      return;
+    };
+    let body = serde_json::json!({
+      "type": "SET_VOLUME",
+      "requestId": device.message_manager.generate_request_id().get(),
+      "mediaSessionId": media_session_id,
+      "volume": { "level": level },
+    });
+    let message = rust_cast::message_manager::CastMessage {
+      namespace: MEDIA_NAMESPACE.to_owned(),
+      source: "sender-0".to_owned(),
+      destination: transport_id.to_owned(),
+      payload: rust_cast::message_manager::CastMessagePayload::String(body.to_string()),
+    };
+    match device.message_manager.send(message) {
+      Ok(()) => tracing::debug!(device_id = %self.device_id, media_session_id, level, "Cast stream volume set"),
+      Err(err) => tracing::debug!(device_id = %self.device_id, error = %err, "Cast stream volume failed"),
     }
   }
 
@@ -2270,6 +2323,9 @@ impl WorkerState {
           url = %content_url,
           "warm Cast load"
         );
+        if let Some(level) = self.stream_level {
+          self.send_stream_volume(&session.transport_id, session.media_session_id, level);
+        }
         Ok(session)
       },
     }
@@ -2556,6 +2612,9 @@ impl WorkerState {
 
   /// Read linear volume from `receiver.get_status()` (muted → `0.0`). Retries once on failure.
   fn handle_get_volume(&mut self) -> Result<f32> {
+    if let Some(level) = self.stream_level {
+      return Ok(level);
+    }
     if self.device.is_none() {
       self.ensure_connected(true)?;
     }

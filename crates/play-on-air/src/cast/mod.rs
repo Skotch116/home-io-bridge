@@ -270,6 +270,12 @@ pub trait CastControl: Send + Sync + std::fmt::Debug {
   fn set_volume(&self, key: &str, level: f32) -> Result<()>;
   /// Read receiver volume (`0.0..=1.0`; muted is `0.0`).
   fn get_volume(&self, key: &str) -> Result<f32>;
+  /// Home.io Bridge: volume of the playing media stream itself (`0.0..=1.0`), for a speaker whose
+  /// loudness does not follow its receiver volume. Kept for the next LOADs, and `get_volume` then
+  /// answers with it. Without an override this is the receiver volume.
+  fn set_stream_volume(&self, key: &str, level: f32) -> Result<()> {
+    self.set_volume(key, level)
+  }
   /// Pause the active media session; returns the status the receiver answered with.
   fn pause(&self, key: &str) -> Result<MediaPlayback>;
   /// Resume the active media session.

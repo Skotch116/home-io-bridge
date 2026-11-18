@@ -126,7 +126,9 @@ impl Bridge {
   async fn set_own_volume(&self, device_id: &str, level: f32) {
     let pool = Arc::clone(&self.cast_pool);
     let id = device_id.to_owned();
-    match tokio::task::spawn_blocking(move || pool.set_volume(&id, level)).await {
+    let stream = self.registry.get(device_id).is_some_and(|device| crate::audio::sync::uses_stream_volume(&device.model));
+    let set = move || if stream { pool.set_stream_volume(&id, level) } else { pool.set_volume(&id, level) };
+    match tokio::task::spawn_blocking(set).await {
       Ok(Ok(())) => {},
       Ok(Err(err)) => {
         tracing::debug!(device_id = %device_id, error = %err, "Cast volume sync failed");

@@ -71,6 +71,8 @@ impl App {
   pub async fn run(self, shutdown: watch::Receiver<bool>) -> Result<()> {
     let registry = Arc::clone(&self.registry);
     let config = self.config;
+    // Home.io Bridge: answers Home.io about speaker delays, when asked to (HOMEIO_BRIDGE_PORT).
+    drop(tokio::spawn(crate::homeio::serve(Arc::clone(&registry))));
 
     let (event_tx, event_rx) = mpsc::unbounded_channel::<AirPlaySessionEvent>();
     let (ownership_tx, mut ownership_rx) = mpsc::unbounded_channel::<String>();
@@ -414,30 +416,24 @@ async fn apply_stale_expiry(
   bridge: &Bridge,
   guards: &MaintainGuards,
 ) {
-  // macOS: mDNS Rmv + grace is primary leave; TTL is a silent-disappear backstop.
-  // Linux: ServiceRemoved is ignored; leave only when last_seen > TTL AND Cast warm
-  // worker reports unreachable (healthy Cast keeps the AirPlay ad forever).
+  // A speaker leaves only when it was last seen over the TTL ago AND its warm Cast
+  // worker reports it unreachable (a healthy Cast speaker keeps its AirPlay ad).
+  // Home.io Bridge: the Linux rule on every system. On a Mac the speakers were dropped 10 minutes after they
+  // were last seen announcing, though they were still there and reachable.
   let expired = {
-    #[cfg(target_os = "linux")]
-    {
-      use crate::registry::should_leave_linux_stale;
-      registry.expire_stale_where(DEFAULT_STALE_TTL, |dev| {
-        let cast_reachable = cast_pool.is_reachable(&dev.id);
-        let leave = should_leave_linux_stale(true, cast_reachable);
-        if !leave {
-          tracing::debug!(
-            id = %dev.id,
-            cast_reachable,
-            "stale mDNS last_seen but Cast reachable; not expiring"
-          );
-        }
-        leave
-      })
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-      registry.expire_stale(DEFAULT_STALE_TTL)
-    }
+    use crate::registry::should_leave_linux_stale;
+    registry.expire_stale_where(DEFAULT_STALE_TTL, |dev| {
+      let cast_reachable = cast_pool.is_reachable(&dev.id);
+      let leave = should_leave_linux_stale(true, cast_reachable);
+      if !leave {
+        tracing::debug!(
+          id = %dev.id,
+          cast_reachable,
+          "stale mDNS last_seen but Cast reachable; not expiring"
+        );
+      }
+      leave
+    })
   };
   for dev in &expired {
     tracing::info!(id = %dev.id, name = %dev.name, "expired stale Chromecast");

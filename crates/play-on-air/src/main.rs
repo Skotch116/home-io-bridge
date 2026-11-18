@@ -81,6 +81,23 @@ fn spawn_signal_handler(shutdown_tx: watch::Sender<bool>) -> tokio::task::JoinHa
   })
 }
 
+/// Home.io Bridge: with `HOMEIO_BRIDGE_PARENT` set (the app that starts the engine sets it), ends when
+/// that app is gone, however it went. Otherwise an engine outlives a crashed or replaced app, keeps
+/// the ports and shows every speaker twice.
+#[cfg(unix)]
+async fn parent_gone() {
+  if std::env::var_os("HOMEIO_BRIDGE_PARENT").is_none() {
+    return std::future::pending().await;
+  }
+  let parent = std::os::unix::process::parent_id();
+  loop {
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    if std::os::unix::process::parent_id() != parent {
+      return;
+    }
+  }
+}
+
 /// Wait for one SIGINT or SIGTERM (or Ctrl-C on non-unix).
 async fn wait_for_first_shutdown_signal() {
   let ctrl_c = tokio::signal::ctrl_c();
@@ -107,6 +124,9 @@ async fn wait_for_first_shutdown_signal() {
           std::future::pending::<()>().await;
         }
       } => {}
+      () = parent_gone() => {
+        tracing::info!("the app that started this engine is gone");
+      }
     }
   }
 

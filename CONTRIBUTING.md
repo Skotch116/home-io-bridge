@@ -1,5 +1,10 @@
 # Contributing
 
+> **This is Home.io Bridge, a fork of PlayOnAir** (from its 0.4.0 release). What follows is PlayOnAir's own text, kept
+> as its author wrote it. In the fork the add-on folder is `home_io_bridge/` (not `play-on-air/`), the image is
+> `ghcr.io/skotch116/home-io-bridge`, the add-on has its own version in `home_io_bridge/config.yaml`, and the fork's
+> changes have not been put through the format and lint gates described here. See `README.md`.
+
 PlayOnAir is personal MIT open source maintained by Felipe Lima. Useful patches are welcome.
 
 ## Language

@@ -39,12 +39,8 @@ audit:
 machete:
     cd "{{root}}" && cargo machete --with-metadata
 
-# Check release version surfaces agree; optional arg is the expected version (e.g. from a vX.Y.Z tag).
-version-check *version:
-    cd "{{root}}" && scripts/check-version-sync.sh {{version}}
-
 # Full quality gate.
-check: fmt-check lint test deny audit machete version-check
+check: fmt-check lint test deny audit machete
 
 # Run the binary (optional args after `--`).
 run *args:

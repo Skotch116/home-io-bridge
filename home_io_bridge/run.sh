@@ -37,7 +37,8 @@ write_toml_from_options() {
         exit 1
         ;;
     esac
-    export RUST_LOG="${log_level}"
+    # (what timing and volume did, one line a second while playing: the same detail the Mac host logs)
+    export RUST_LOG="${log_level},play_on_air::bridge=debug,play_on_air::audio::sync=debug,play_on_air::cast::pool=debug"
   fi
 
   config_dir="$(dirname "${config_path}")"
@@ -73,4 +74,9 @@ if [[ -f "${OPTIONS_FILE}" ]]; then
   write_toml_from_options "${OPTIONS_FILE}" "${CONFIG_PATH}"
 fi
 
+# The log also goes to engine.log beside the settings (it starts over with the engine), so it can be read as a file.
+LOG_DIR="${HOMEIO_BRIDGE_DIR:-}"
+if [[ -n "${LOG_DIR}" && -d "${LOG_DIR}" ]]; then
+  exec play-on-air --config "${CONFIG_PATH}" > >(tee "${LOG_DIR}/engine.log") 2>&1
+fi
 exec play-on-air --config "${CONFIG_PATH}"

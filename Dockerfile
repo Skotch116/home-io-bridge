@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 
-# PlayOnAir multi-stage image (glibc). Used by Home Assistant OS via GHCR.
+# Home.io Bridge (a fork of PlayOnAir) multi-stage image (glibc). Used by Home Assistant OS via GHCR.
 # Build args: BUILD_VERSION, BUILD_ARCH (HA: amd64 | aarch64)
 
 ARG BUILD_VERSION=0.4.0
@@ -51,18 +51,18 @@ RUN apt-get update \
   && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /tmp/play-on-air /usr/local/bin/play-on-air
-COPY play-on-air/run.sh /usr/local/bin/play-on-air-entrypoint
+COPY home_io_bridge/run.sh /usr/local/bin/play-on-air-entrypoint
 RUN chmod +x /usr/local/bin/play-on-air-entrypoint
 
 # Home Assistant Supervisor labels + OCI metadata.
-LABEL org.opencontainers.image.title="PlayOnAir" \
-  org.opencontainers.image.description="Chromecast devices as AirPlay 2 speakers on the local network" \
-  org.opencontainers.image.source="https://github.com/felipefdl/play-on-air" \
-  org.opencontainers.image.url="https://github.com/felipefdl/play-on-air" \
+LABEL org.opencontainers.image.title="Home.io Bridge" \
+  org.opencontainers.image.description="Google Cast speakers as AirPlay 2 speakers, in time with your other speakers" \
+  org.opencontainers.image.source="https://github.com/Skotch116/home-io-bridge" \
+  org.opencontainers.image.url="https://github.com/Skotch116/home-io-bridge" \
   org.opencontainers.image.licenses="MIT" \
   org.opencontainers.image.version="${BUILD_VERSION}" \
-  io.hass.name="PlayOnAir" \
-  io.hass.description="Chromecast devices as AirPlay 2 speakers on the local network" \
+  io.hass.name="Home.io Bridge" \
+  io.hass.description="Google Cast speakers as AirPlay 2 speakers, in time with your other speakers" \
   io.hass.type="app" \
   io.hass.version="${BUILD_VERSION}" \
   io.hass.arch="${BUILD_ARCH}"

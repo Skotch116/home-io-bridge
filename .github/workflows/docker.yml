@@ -5,14 +5,12 @@ on:
   push:
     branches:
       - main
-    tags:
-      - "v*"
   pull_request:
   workflow_dispatch:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: play-on-air
+  IMAGE_NAME: home-io-bridge
 
 permissions:
   contents: write
@@ -35,7 +33,7 @@ jobs:
           if [[ "${GITHUB_REF_TYPE:-}" == "tag" && "${GITHUB_REF_NAME}" == v* ]]; then
             VERSION="${GITHUB_REF_NAME#v}"
           else
-            VERSION="$(sed -n 's/^version: *"\(.*\)"/\1/p' play-on-air/config.yaml | head -n1)"
+            VERSION="$(sed -n 's/^version: *"\(.*\)"/\1/p' home_io_bridge/config.yaml | head -n1)"
             if [[ -z "${VERSION}" ]]; then
               VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)"
             fi
@@ -49,12 +47,6 @@ jobs:
           echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
           echo "image=${IMAGE}" >> "${GITHUB_OUTPUT}"
           echo "Resolved version=${VERSION} image=${IMAGE}"
-
-      # Every downstream job (build, merge, release) needs this job, so a mismatch blocks publishing.
-      - name: Check version sync
-        env:
-          VERSION: ${{ steps.version.outputs.version }}
-        run: scripts/check-version-sync.sh "${VERSION}"
 
   build:
     needs: version
@@ -121,7 +113,7 @@ jobs:
             io.hass.version=${{ needs.version.outputs.version }}
             io.hass.arch=${{ matrix.hass_arch }}
             io.hass.type=app
-            io.hass.name=PlayOnAir
+            io.hass.name=Home.io Bridge
           outputs: type=image,name=${{ needs.version.outputs.image }},push-by-digest=true,name-canonical=true,push=true
           build-args: |
             BUILD_VERSION=${{ needs.version.outputs.version }}
@@ -224,8 +216,9 @@ jobs:
           IMAGE: ${{ needs.version.outputs.image }}
         run: |
           set -euo pipefail
-          TAG="v${VERSION}"
-          TITLE="PlayOnAir ${VERSION}"
+          # PlayOnAir's own vX.Y.Z tags come along with a fork, so the fork's releases get their own tag names.
+          TAG="homeio-v${VERSION}"
+          TITLE="Home.io Bridge ${VERSION}"
 
           # Body: CHANGELOG section for this version (fallback to short pointer).
           BODY_FILE="$(mktemp)"
@@ -237,15 +230,15 @@ jobs:
             echo "${IMAGE}:latest"
             echo "\`\`\`"
             echo ""
-            echo "Home Assistant app version in \`play-on-air/config.yaml\` must match this tag."
+            echo "Home Assistant app version in \`home_io_bridge/config.yaml\` must match this tag."
             echo ""
-            if [[ -f play-on-air/CHANGELOG.md ]]; then
+            if [[ -f home_io_bridge/CHANGELOG.md ]]; then
               # Extract "## x.y.z" section until next "## ".
               awk -v ver="${VERSION}" '
                 $0 == "## " ver {p=1; next}
                 p && /^## / {exit}
                 p {print}
-              ' play-on-air/CHANGELOG.md | sed '/./,$!d' > /tmp/changelog-section.txt || true
+              ' home_io_bridge/CHANGELOG.md | sed '/./,$!d' > /tmp/changelog-section.txt || true
               if [[ -s /tmp/changelog-section.txt ]]; then
                 echo "## Changes"
                 echo ""

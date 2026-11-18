@@ -1,0 +1,35 @@
+name: Home.io Bridge
+version: "0.2.0"
+slug: home_io_bridge
+description: >
+  Makes the Google Cast speakers on your network show up as AirPlay 2 speakers and keeps them in time
+  with your other AirPlay speakers.
+url: https://github.com/Skotch116/home-io-bridge
+arch:
+  - aarch64
+  - amd64
+init: false
+startup: services
+boot: auto
+host_network: true
+stage: experimental
+# Ready-built by .github/workflows/docker.yml (one image for both kinds of machine).
+image: "ghcr.io/skotch116/home-io-bridge"
+options:
+  log_level: info
+  # Optional: rename or hide a speaker. Empty means every Google speaker found is offered as it is.
+  device_overrides: []
+schema:
+  log_level: list(trace|debug|info|warn|error)
+  device_overrides:
+    - id: str
+      name: "str?"
+      hide: "bool?"
+map:
+  - type: addon_config
+    read_only: false
+environment:
+  PLAY_ON_AIR_CONFIG: /config/play-on-air.toml
+  # Home.io finds the add-on on the network and reads and sets speaker delays here.
+  HOMEIO_BRIDGE_PORT: "8176"
+  HOMEIO_BRIDGE_DIR: /config

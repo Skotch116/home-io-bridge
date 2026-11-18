@@ -1,6 +1,7 @@
 # MIT License
 
 Copyright (c) 2026 Felipe Lima
+Copyright (c) 2026 Home.io (the Home.io Bridge changes)
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal

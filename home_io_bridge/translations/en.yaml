@@ -7,7 +7,7 @@ configuration:
   device_overrides:
     name: Optional rename / hide
     description: >
-      Leave this list empty for normal use. Chromecasts are discovered automatically
+      Leave this list empty for normal use. Google Cast speakers are found automatically
       and appear in AirPlay with their Cast names — you do not register devices here.
       Add a row only when you want to rename a speaker in the AirPlay picker or hide
       one entirely. Match id is a case-insensitive substring of the Cast name or UUID.

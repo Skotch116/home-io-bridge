@@ -1,5 +1,7 @@
 # Security
 
+This is Home.io Bridge, a fork of PlayOnAir; what follows is PlayOnAir's description, which holds for the fork. The fork adds one thing on the network: a small service (port 8176 in the add-on) that lists the speakers and takes a delay per speaker model, with no sign-in, for Home.io on the same network.
+
 PlayOnAir is a **LAN-only** audio bridge. It does not create accounts, phone home, or send telemetry.
 
 ## Trust model
@@ -20,4 +22,4 @@ The Home Assistant app sets `host_network: true` so mDNS multicast, AirPlay adve
 
 ## Reporting issues
 
-Please open an issue on [github.com/felipefdl/play-on-air](https://github.com/felipefdl/play-on-air) with a clear description and reproduction notes. Do not include private keys, pairing secrets, or full LAN inventories beyond what is needed to debug.
+For this fork, please open an issue on [github.com/Skotch116/home-io-bridge](https://github.com/Skotch116/home-io-bridge) with a clear description and reproduction notes. Do not include private keys, pairing secrets, or full LAN inventories beyond what is needed to debug.

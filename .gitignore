@@ -18,3 +18,7 @@ play-on-air.toml
 # Local run logs
 /log.txt
 *.log
+
+# Home.io Bridge Mac app
+/mac/.build
+/mac/build

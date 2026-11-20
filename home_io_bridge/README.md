@@ -27,6 +27,10 @@ Run one bridge per home. If Home.io on a Mac is also set to make Google speakers
 
 Nest Mini, Nest Audio and Nest Hub. Other Cast devices play, but not in time with AirPlay speakers.
 
+If one of those three can't be brought back into time (three tries, then a minute still off), the log says
+"still out of time after every step" and Home.io shows it under the speaker in Music. Stop the music and start it
+again.
+
 ## Built on
 
 A fork of [PlayOnAir](https://github.com/felipefdl/play-on-air) by Felipe Lima (MIT), from its 0.4.0 release, which

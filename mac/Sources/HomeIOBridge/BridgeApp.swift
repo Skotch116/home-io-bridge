@@ -14,14 +14,30 @@ final class CastSpeakers: ObservableObject {
     }
 
     @Published var found: [Speaker] = []
+    /// Ids of the speakers the engine can't bring back into time right now (looked at every 5 seconds).
+    @Published var outOfTime: Set<String> = []
     private var browser: NWBrowser?
+    private var looking: Timer?
 
     /// Answers Home.io on a phone about these speakers' delays (not for the `-list` test).
     private var server: DelayServer?
 
     init() {
         start()
-        if !CommandLine.arguments.contains("-list") { server = DelayServer(speakers: self) }
+        guard !CommandLine.arguments.contains("-list") else { return }
+        server = DelayServer(speakers: self)
+        looking = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
+            Task { @MainActor in
+                let late = Delays.outOfTime()
+                if self?.outOfTime != late { self?.outOfTime = late }
+            }
+        }
+    }
+
+    /// What the menu says about a speaker's timing, or nil when it is kept in time.
+    func note(for s: Speaker) -> String? {
+        if !Delays.synced.contains(s.model) { return "not kept in time" }
+        return outOfTime.contains(s.id) ? "out of time right now" : nil
     }
 
     /// Looks until the browser fails, then starts over half a minute on.
@@ -168,7 +184,15 @@ struct BridgeApp: App {
                 Text("Looking for Google speakers…")
             } else {
                 Text("Google speakers on this network")
-                ForEach(speakers.found) { s in Text("\(s.name) · \(s.model)") }
+                ForEach(speakers.found) { s in
+                    Text("\(s.name) · \(s.model)" + (speakers.note(for: s).map { " · \($0)" } ?? ""))
+                }
+                if speakers.found.contains(where: { !Delays.synced.contains($0.model) }) {
+                    Text("Not kept in time: it plays, but can lag your AirPlay speakers.")
+                }
+                if speakers.found.contains(where: { speakers.outOfTime.contains($0.id) }) {
+                    Text("Out of time right now: stop the music and start it again.")
+                }
             }
             Divider()
             Text(!engine.present ? "This copy was built without the AirPlay engine."

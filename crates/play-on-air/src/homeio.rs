@@ -2,7 +2,8 @@
 //!
 //! Only when `HOMEIO_BRIDGE_PORT` is set (the Home Assistant add-on sets it; on a Mac the Home.io Bridge app answers
 //! instead). A very small HTTP, announced on the network as `_homeio-bridge._tcp`:
-//!   GET  /speakers -> {"speakers":[{"name":"Kitchen Display","model":"Google Nest Hub","delay":0,"synced":true}]}
+//!   GET  /speakers -> {"speakers":[{"name":"Kitchen Display","model":"Google Nest Hub","delay":0,"synced":true,"outOfTime":false}]}
+//!   (`synced`: a model this engine keeps in time; `outOfTime`: one of those it can't bring back right now)
 //!   POST /delay {"model":"Google Nest Hub","delay":40} -> the same list
 //! A delay is all it can change, and only within 500 ms either way.
 
@@ -15,7 +16,7 @@ use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::audio::sync::{is_calibrated, owner_delay_ms, set_owner_delay_ms};
+use crate::audio::sync::{is_calibrated, out_of_time, owner_delay_ms, set_owner_delay_ms};
 use crate::registry::DeviceRegistry;
 
 const SERVICE: &str = "_homeio-bridge._tcp.local.";
@@ -29,6 +30,7 @@ struct Asked {
 fn speakers(registry: &DeviceRegistry) -> Json<Value> {
   let mut list: Vec<_> = registry.list_present();
   list.sort_by(|a, b| a.name.cmp(&b.name));
+  let late = out_of_time();
   let speakers: Vec<Value> = list
     .iter()
     .map(|dev| {
@@ -37,6 +39,7 @@ fn speakers(registry: &DeviceRegistry) -> Json<Value> {
         "model": dev.model,
         "delay": owner_delay_ms(&dev.model),
         "synced": is_calibrated(&dev.model),
+        "outOfTime": late.contains(&dev.id),
       })
     })
     .collect();

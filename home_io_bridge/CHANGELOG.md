@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.1
+
+- Says when a speaker can't be kept in time: after three tries and a minute still off, the log says so and Home.io
+  shows "Out of time right now" under the speaker until it is back.
+
 ## 0.2.0
 
 First public version, as a fork of PlayOnAir 0.4.0.

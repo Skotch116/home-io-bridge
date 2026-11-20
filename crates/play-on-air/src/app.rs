@@ -73,6 +73,7 @@ impl App {
     let config = self.config;
     // Home.io Bridge: answers Home.io about speaker delays, when asked to (HOMEIO_BRIDGE_PORT).
     drop(tokio::spawn(crate::homeio::serve(Arc::clone(&registry))));
+    crate::audio::sync::forget_out_of_time();
 
     let (event_tx, event_rx) = mpsc::unbounded_channel::<AirPlaySessionEvent>();
     let (ownership_tx, mut ownership_rx) = mpsc::unbounded_channel::<String>();

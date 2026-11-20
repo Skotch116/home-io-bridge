@@ -20,6 +20,13 @@ enum Delays {
         return out
     }
 
+    /// The speakers (by Cast id) the engine says are playing out of time right now and that it could not bring
+    /// back: lines of `late.txt`, which the engine keeps while it runs.
+    static func outOfTime() -> Set<String> {
+        let text = (try? String(contentsOf: Engine.support.appending(path: "late.txt"), encoding: .utf8)) ?? ""
+        return Set(text.split(separator: "\n").map(String.init))
+    }
+
     static func set(_ ms: Int, for model: String) {
         var all = all()
         all[model] = min(max(ms, -limit), limit)
@@ -31,7 +38,8 @@ enum Delays {
 
 /// Lets Home.io on a phone on this network read and set those delays. It announces itself as `_homeio-bridge._tcp`
 /// and speaks a very small HTTP:
-///   GET /speakers            -> {"speakers":[{"name":"Kitchen Display","model":"Google Nest Hub","delay":0,"synced":true}]}
+///   GET /speakers            -> {"speakers":[{"name":"Kitchen Display","model":"Google Nest Hub","delay":0,"synced":true,"outOfTime":false}]}
+///   (`synced`: a model the engine keeps in time; `outOfTime`: one of those it can't bring back right now)
 ///   POST /delay {"model":"Google Nest Hub","delay":40} -> the same list
 /// A delay is all it can change, and only within `Delays.limit`.
 @MainActor
@@ -96,9 +104,10 @@ final class DelayServer {
         default:
             status = "404 Not Found"
         }
-        let delays = Delays.all()
+        let delays = Delays.all(), late = Delays.outOfTime()
         let list = speakers.found.map { s in
-            ["name": s.name, "model": s.model, "delay": delays[s.model] ?? 0, "synced": Delays.synced.contains(s.model)] as [String: Any]
+            ["name": s.name, "model": s.model, "delay": delays[s.model] ?? 0, "synced": Delays.synced.contains(s.model),
+             "outOfTime": late.contains(s.id)] as [String: Any]
         }
         let body = (try? JSONSerialization.data(withJSONObject: ["speakers": list])) ?? Data()
         let head = "HTTP/1.1 \(status)\r\nContent-Type: application/json\r\nContent-Length: \(body.count)\r\nConnection: close\r\n\r\n"

@@ -27,6 +27,10 @@ const STEP_AFTER_TICKS: u32 = 3;
 /// still off after that is off for a reason a step can't fix, and the slew is left to it.
 const STEP_SPACING: Duration = Duration::from_secs(20);
 const STEP_LIMIT: u32 = 3;
+/// With the steps used up, an error still past the threshold on this many ticks in a row (a minute, more
+/// than the slew needs for anything it can close) means this speaker is not being kept in time: the
+/// owner is told (`late.txt`) until it is back.
+const LATE_AFTER_TICKS: u32 = 60;
 
 type StepFn = Arc<dyn Fn() + Send + Sync>;
 
@@ -71,6 +75,14 @@ pub(super) struct SyncSession {
   over: AtomicU32,
   /// Steps asked for so far, and when the last one was.
   stepped: parking_lot::Mutex<(u32, Option<Instant>)>,
+  /// Listed in `late.txt` as out of time.
+  late: AtomicBool,
+}
+
+impl Drop for SyncSession {
+  fn drop(&mut self) {
+    self.set_late(false);
+  }
 }
 
 impl std::fmt::Debug for SyncSession {
@@ -121,7 +133,20 @@ impl SyncSession {
       step: parking_lot::Mutex::new(None),
       over: AtomicU32::new(0),
       stepped: parking_lot::Mutex::new((0, None)),
+      late: AtomicBool::new(false),
     }
+  }
+
+  fn set_late(&self, late: bool) {
+    if self.late.swap(late, Ordering::AcqRel) == late {
+      return;
+    }
+    if late {
+      tracing::warn!(device = %self.device_id, model = %self.model, "sync: still out of time after every step; the owner is told");
+    } else {
+      tracing::info!(device = %self.device_id, "sync: no longer listed as out of time");
+    }
+    crate::audio::sync::set_out_of_time(&self.device_id, late);
   }
 
   /// Where a clean timed start landed (`error_secs` on the first drift tick, before any correction):
@@ -150,14 +175,21 @@ impl SyncSession {
   fn step_if_due(&self, error_secs: f64) -> bool {
     if error_secs.abs() <= crate::audio::sync::DRIFT_STEP_SECS {
       self.over.store(0, Ordering::Release);
+      self.set_late(false);
       return false;
     }
-    if self.over.fetch_add(1, Ordering::AcqRel) + 1 < STEP_AFTER_TICKS {
+    let over = self.over.fetch_add(1, Ordering::AcqRel) + 1;
+    if over < STEP_AFTER_TICKS {
       return false;
     }
     let step = {
       let mut stepped = self.stepped.lock();
       if stepped.0 >= STEP_LIMIT || stepped.1.is_some_and(|at| at.elapsed() < STEP_SPACING) {
+        let late = is_late(over, stepped.0);
+        drop(stepped);
+        if late {
+          self.set_late(true);
+        }
         return false;
       }
       *stepped = (stepped.0 + 1, Some(Instant::now()));
@@ -457,6 +489,11 @@ async fn drift_tick(sync: &SyncSession, ema: Option<f64>) -> Option<f64> {
   Some(smoothed)
 }
 
+/// Out of time for good, as far as this session can tell: no step left and a minute past the threshold.
+fn is_late(over: u32, steps: u32) -> bool {
+  steps >= STEP_LIMIT && over >= LATE_AFTER_TICKS
+}
+
 struct SampleError {
   s_aud: f64,
   due: Instant,
@@ -504,6 +541,13 @@ async fn playback(sync: &SyncSession) -> Option<MediaPlayback> {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn a_speaker_counts_as_out_of_time_only_with_no_step_left_and_a_minute_off() {
+    assert!(!is_late(LATE_AFTER_TICKS, STEP_LIMIT - 1), "a step can still bring it back");
+    assert!(!is_late(LATE_AFTER_TICKS - 1, STEP_LIMIT), "the slew may still be closing it");
+    assert!(is_late(LATE_AFTER_TICKS, STEP_LIMIT));
+  }
 
   #[test]
   fn arm_wait_plays_at_the_mark_or_after_a_bounded_grace() {

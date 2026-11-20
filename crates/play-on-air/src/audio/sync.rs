@@ -186,6 +186,40 @@ pub(crate) fn set_learned_start_ms(model: &str, ms: i64) {
   let _written = std::fs::write(path, text);
 }
 
+/// Home.io Bridge: the speakers playing out of time right now that the engine could not bring back, so the
+/// owner is told instead of left to wonder. Lines of device id in `late.txt`, empty when the engine starts.
+pub(crate) fn out_of_time() -> Vec<String> {
+  let Some(text) = bridge_file("late.txt").and_then(|path| std::fs::read_to_string(path).ok()) else {
+    return Vec::new();
+  };
+  text.lines().filter(|id| !id.is_empty()).map(str::to_owned).collect()
+}
+
+pub(crate) fn set_out_of_time(device_id: &str, out: bool) {
+  write_out_of_time(&with_out_of_time(out_of_time(), device_id, out));
+}
+
+pub(crate) fn forget_out_of_time() {
+  write_out_of_time(&[]);
+}
+
+fn with_out_of_time(mut all: Vec<String>, device_id: &str, out: bool) -> Vec<String> {
+  all.retain(|id| id != device_id);
+  if out {
+    all.push(device_id.to_owned());
+  }
+  all
+}
+
+fn write_out_of_time(all: &[String]) {
+  let Some(path) = bridge_file("late.txt") else { return };
+  if let Some(folder) = path.parent() {
+    let _made = std::fs::create_dir_all(folder);
+  }
+  let text: String = all.iter().map(|id| format!("{id}\n")).collect();
+  let _written = std::fs::write(path, text);
+}
+
 /// What one drift tick asks the encoder to do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DriftAction {
@@ -828,6 +862,14 @@ mod tests {
     let learned = vec![("Google Nest Hub".to_owned(), -77)];
     assert_eq!(learned_start_from(learned.clone(), "Google Nest Hub"), -77);
     assert_eq!(learned_start_from(learned, NEST_MINI_MODEL), 10);
+  }
+
+  #[test]
+  fn a_speaker_is_listed_out_of_time_once_and_taken_off_again() {
+    let one = with_out_of_time(Vec::new(), "a", true);
+    assert_eq!(with_out_of_time(one.clone(), "a", true), vec!["a".to_owned()]);
+    assert_eq!(with_out_of_time(one.clone(), "b", true), vec!["a".to_owned(), "b".to_owned()]);
+    assert!(with_out_of_time(one, "a", false).is_empty());
   }
 
   #[test]

@@ -1,5 +1,5 @@
 name: Home.io Bridge
-version: "0.2.0"
+version: "0.2.1"
 slug: home_io_bridge
 description: >
   Makes the Google Cast speakers on your network show up as AirPlay 2 speakers and keeps them in time

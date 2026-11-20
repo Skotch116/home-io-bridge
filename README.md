@@ -27,7 +27,11 @@ speakers, so a mixed group echoes. This one is built to stay in step:
 
 ## What it can't do yet
 
-- Only **Nest Hub, Nest Mini and Nest Audio** are kept in time. Any other Cast device plays, but with no timing.
+- Only **Nest Hub, Nest Mini and Nest Audio** are kept in time. Any other Cast device plays, but with no timing; the
+  Mac menu and Home.io say so beside it ("not kept in time").
+- When one of those three can't be brought back into time (three tries, then a minute still off), the bridge says so:
+  "out of time right now" in the Mac menu and in Home.io's Music screen, `"outOfTime":true` in the timing service.
+  Stopping the music and starting it again gives the speaker a fresh start.
   (Nest Audio uses the numbers of the engine this is built on; it has not been tried here.)
 - The timing numbers come from one home: a Nest Hub and a Nest Mini, with ecobee and HomePod speakers.
   Your speakers may land a little differently; the first seconds of the first play are where you would hear it.
@@ -80,7 +84,7 @@ its clock is (needs `pip install pychromecast`).
 
 The bridge announces `_homeio-bridge._tcp` and answers, with no sign-in, on your home network only:
 
-- `GET /speakers` → `{"speakers":[{"name":"…","model":"Google Nest Hub","delay":0,"synced":true}]}`
+- `GET /speakers` → `{"speakers":[{"name":"…","model":"Google Nest Hub","delay":0,"synced":true,"outOfTime":false}]}`
 - `POST /delay` with `{"model":"Google Nest Hub","delay":40}` (milliseconds, positive plays later, within 500)
 
 A delay is all it can change.

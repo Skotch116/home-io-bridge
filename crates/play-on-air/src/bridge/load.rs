@@ -38,9 +38,9 @@ pub(super) const SYNC_STEP_REASON: &str = "sync_step";
 
 /// How long teardown waits for an in-flight blocking Cast LOAD.
 ///
-/// Cast pool `COMMAND_TIMEOUT` is 6 s; keep a small margin so a slow LOAD is joined
-/// instead of detached, without re-introducing the old 30 s HOL risk.
-pub(super) const INFLIGHT_LOAD_JOIN_TIMEOUT: Duration = Duration::from_secs(8);
+/// Cast pool `LOAD_TIMEOUT` is 10 s (Home.io Bridge; it was 6 s); keep a small margin so a slow LOAD
+/// is joined instead of detached, without re-introducing the old 30 s HOL risk.
+pub(super) const INFLIGHT_LOAD_JOIN_TIMEOUT: Duration = Duration::from_secs(12);
 
 /// How Cast volume is applied after a progressive media LOAD.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -723,10 +723,10 @@ mod tests {
 
   #[test]
   fn inflight_load_join_timeout_covers_cast_command_timeout() {
-    // Cast pool COMMAND_TIMEOUT is 6s; teardown joins with a small margin.
+    // Cast pool LOAD_TIMEOUT is 10s; teardown joins with a small margin.
     assert!(
-      INFLIGHT_LOAD_JOIN_TIMEOUT >= Duration::from_secs(6),
-      "INFLIGHT_LOAD_JOIN_TIMEOUT={INFLIGHT_LOAD_JOIN_TIMEOUT:?} must be >= 6s (Cast cmd)"
+      INFLIGHT_LOAD_JOIN_TIMEOUT >= Duration::from_secs(10),
+      "INFLIGHT_LOAD_JOIN_TIMEOUT={INFLIGHT_LOAD_JOIN_TIMEOUT:?} must be >= 10s (Cast LOAD)"
     );
     assert!(
       INFLIGHT_LOAD_JOIN_TIMEOUT <= Duration::from_secs(12),

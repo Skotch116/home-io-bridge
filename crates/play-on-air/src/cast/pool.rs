@@ -184,8 +184,13 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(4);
 /// device reaches the sender within half a second (ownership probes keep the heartbeat cadence).
 const ACTIVE_DRAIN_INTERVAL: Duration = Duration::from_millis(500);
 
-/// Wall-clock wait for load / stop / pause / play worker replies.
+/// Wall-clock wait for stop / pause / play worker replies.
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(6);
+
+/// Home.io Bridge: wall-clock wait for a LOAD reply. A speaker that has to start its media receiver
+/// first can take longer than the 6 s of the other commands, and a LOAD given up on was not harmless:
+/// the session fell back to WAV, which a speaker kept in time can't be kept in time with.
+const LOAD_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Wall-clock wait for volume get/set worker replies.
 const VOLUME_TIMEOUT: Duration = Duration::from_secs(3);
@@ -204,6 +209,15 @@ const BUFFERING_STUCK_PROBES: u8 = 3;
 
 /// Skip internal re-LOAD if a LOAD command arrived within this window (bridge rollover guard).
 const RECENT_LOAD_GUARD: Duration = Duration::from_secs(10);
+
+/// Home.io Bridge: a control connection the speaker closes sooner than this after it was made counts
+/// as closed "right away"; from the second such close in a row the reconnect waits out the backoff.
+const SHORT_LIVED_CONNECTION: Duration = Duration::from_secs(10);
+
+/// Home.io Bridge: a failed PAUSE or PLAY is tried once more on a new connection only when the first
+/// try failed within this time. Later than that the sender may have moved on (paused, then played
+/// again), and a command landing late would undo what the listener did last.
+const TRANSPORT_RETRY_WITHIN: Duration = Duration::from_secs(2);
 
 /// Hard deadline for any single blocking Cast op; forces relay shutdown + rebuild.
 const WORKER_OP_DEADLINE: Duration = Duration::from_secs(30);
@@ -443,6 +457,21 @@ pub(crate) fn reconnect_backoff_delay(attempt: u32, jitter_seed: u64) -> Duratio
   let factor_permille = 800 + (unit * 400) / 1000;
   let jittered = base_ms.saturating_mul(u128::from(factor_permille)) / 1000;
   Duration::from_millis(u64::try_from(jittered).unwrap_or(u64::MAX).max(1))
+}
+
+/// Home.io Bridge: closes right after connecting, in a row, given the count so far and how long the
+/// connection that just closed had lived. A connection that lasted starts the count over.
+fn next_short_closes(so_far: u32, lived: Option<Duration>) -> u32 {
+  if lived.is_some_and(|d| d < SHORT_LIVED_CONNECTION) {
+    so_far.saturating_add(1)
+  } else {
+    0
+  }
+}
+
+/// Home.io Bridge: whether a PAUSE / PLAY that failed after `took` may still be sent again.
+fn retry_is_timely(took: Duration) -> bool {
+  took <= TRANSPORT_RETRY_WITHIN
 }
 
 /// Shared slot so the pool can force-close the active relay during `remove`.
@@ -829,7 +858,7 @@ impl CastPool {
 impl CastControl for CastPool {
   /// LOAD media on the warm control plane for `device_id`.
   ///
-  /// Blocks up to [`COMMAND_TIMEOUT`]. If the warm TCP is dead, the worker tries
+  /// Blocks up to [`LOAD_TIMEOUT`]. If the warm TCP is dead, the worker tries
   /// reconnect with backoff before failing the command.
   ///
   /// On timeout the caller marks the op abandoned: a late worker success must STOP
@@ -844,13 +873,13 @@ impl CastControl for CastPool {
       abandoned: Arc::clone(&abandoned),
     })
     .map_err(|_send| Error::Cast(format!("warm Cast worker for {device_id} disconnected")))?;
-    match reply_rx.recv_timeout(COMMAND_TIMEOUT) {
+    match reply_rx.recv_timeout(LOAD_TIMEOUT) {
       Ok(result) => result,
       Err(RecvTimeoutError::Timeout) => {
         abandoned.store(true, Ordering::Release);
         Err(Error::Cast(format!(
           "warm Cast load timed out after {}s for {device_id}",
-          COMMAND_TIMEOUT.as_secs()
+          LOAD_TIMEOUT.as_secs()
         )))
       },
       Err(RecvTimeoutError::Disconnected) => {
@@ -1137,6 +1166,10 @@ struct WorkerState {
   logged_source_ip: bool,
   /// Session host (multizone group endpoint): LOAD joins the running receiver instead of launching one.
   join_running_app: bool,
+  /// Home.io Bridge: when the control connection in `device` was made.
+  connected_at: Option<Instant>,
+  /// Home.io Bridge: closes by the speaker in a row that came right after connecting.
+  short_closes: u32,
 }
 
 #[expect(
@@ -1197,6 +1230,8 @@ fn worker_main(
     last_parse_warn: None,
     logged_source_ip: false,
     join_running_app,
+    connected_at: None,
+    short_closes: 0,
   };
 
   // Connect while idle (before any AirPlay session).
@@ -1656,6 +1691,7 @@ impl WorkerState {
         }
 
         self.device = Some(device);
+        self.connected_at = Some(Instant::now());
         self.next_ping_at = Instant::now() + HEARTBEAT_INTERVAL;
         self.note_reachable();
         if self.logged_source_ip {
@@ -1740,11 +1776,7 @@ impl WorkerState {
     self.reachable = false;
     self.reachable_flag.store(false, Ordering::Relaxed);
     self.reconnect_attempt = self.reconnect_attempt.saturating_add(1);
-    let seed = self
-      .device_id
-      .bytes()
-      .fold(0_u64, |acc, b| acc.wrapping_mul(31).wrapping_add(u64::from(b)));
-    let delay = reconnect_backoff_delay(self.reconnect_attempt.saturating_sub(1), seed);
+    let delay = reconnect_backoff_delay(self.reconnect_attempt.saturating_sub(1), self.backoff_seed());
     self.next_reconnect_at = Instant::now() + delay;
     tracing::debug!(
       device_id = %self.device_id,
@@ -1838,7 +1870,7 @@ impl WorkerState {
   /// so an empty socket cannot block for the full command I/O timeout. RAII restores
   /// the command timeout even if the drain exits early.
   fn drain_unsolicited(&mut self) {
-    let (parse_warn, media_entry, receiver_volume) = {
+    let (parse_warn, media_entry, receiver_volume, closed) = {
       let Some(device) = self.device.as_ref() else {
         return;
       };
@@ -1849,6 +1881,7 @@ impl WorkerState {
       let our_session = self.active.as_ref().map(|s| s.media_session_id);
       let mut media_entry = None;
       let mut receiver_volume = None;
+      let mut closed: Option<String> = None;
 
       for _ in 0..UNSOLICITED_DRAIN_LIMIT {
         match device.receive() {
@@ -1888,11 +1921,9 @@ impl WorkerState {
                 {
                   break;
                 }
-                tracing::debug!(
-                  device_id = %self.device_id,
-                  error = %err,
-                  "Cast receive transport error while draining"
-                );
+                // Anything else on a read is a connection that is over (closed by the speaker,
+                // reset, TLS broken): reading it again only repeats the error.
+                closed = Some(msg);
                 break;
               },
               ProbeFailureKind::Parse => {
@@ -1903,7 +1934,7 @@ impl WorkerState {
           },
         }
       }
-      (parse_warn, media_entry, receiver_volume)
+      (parse_warn, media_entry, receiver_volume, closed)
     };
     if let Some(msg) = parse_warn {
       self.warn_parse_once(&msg);
@@ -1913,6 +1944,67 @@ impl WorkerState {
     }
     if let Some(volume) = receiver_volume {
       self.observe_receiver_volume(volume);
+    }
+    if let Some(error) = closed {
+      self.on_connection_closed(&error);
+    }
+  }
+
+  /// Home.io Bridge: the control connection is over, found by the idle read. It is replaced at once,
+  /// keeping the media session: before, the dead connection stayed in use (the read error was only a
+  /// debug line every tick), so the next LOAD, PAUSE or volume change failed first.
+  ///
+  /// A speaker that closes again and again right after connecting is reconnected with the usual
+  /// backoff instead of on every tick.
+  fn on_connection_closed(&mut self, error: &str) {
+    let lived = self.connected_at.take().map(|at| at.elapsed());
+    self.short_closes = next_short_closes(self.short_closes, lived);
+    tracing::info!(
+      device_id = %self.device_id,
+      host = %self.host,
+      lived_s = lived.map(|d| d.as_secs()),
+      playing = self.active.is_some(),
+      closes_in_a_row = self.short_closes,
+      error,
+      "Cast control connection closed by the speaker; reconnecting"
+    );
+    self.device = None;
+    self.shutdown_relay_slot();
+    if self.short_closes > 1 {
+      let delay = reconnect_backoff_delay(self.short_closes.saturating_sub(2), self.backoff_seed());
+      self.next_reconnect_at = Instant::now() + delay;
+      return;
+    }
+    if let Err(err) = self.ensure_connected(true) {
+      tracing::debug!(device_id = %self.device_id, error = %err, "warm Cast reconnect after a closed connection failed");
+    }
+  }
+
+  fn backoff_seed(&self) -> u64 {
+    self
+      .device_id
+      .bytes()
+      .fold(0_u64, |acc, b| acc.wrapping_mul(31).wrapping_add(u64::from(b)))
+  }
+
+  /// Home.io Bridge: drop the control connection and make a new one, for one more try of a command
+  /// that just failed on it. `false` when the speaker can't be reached.
+  fn reconnect_for_retry(&mut self, what: &'static str, err: &Error) -> bool {
+    tracing::warn!(
+      device_id = %self.device_id,
+      host = %self.host,
+      error = %err,
+      what,
+      "warm Cast command failed; trying it once more on a new connection"
+    );
+    self.device = None;
+    self.shutdown_relay_slot();
+    match self.ensure_connected(true) {
+      Ok(()) => true,
+      Err(reconnect_err) => {
+        tracing::warn!(device_id = %self.device_id, error = %reconnect_err, what, "warm Cast reconnect for the retry failed");
+        false
+      },
     }
   }
 
@@ -2682,7 +2774,23 @@ impl WorkerState {
     Ok(())
   }
 
+  /// Home.io Bridge: a PAUSE that fails on a dead control connection is sent once more on a new
+  /// one. Before, the listener's pause was lost (the speaker played on) and only a warning said so.
   fn handle_pause(&mut self, queued_at: Instant) -> Result<MediaPlayback> {
+    let started = Instant::now();
+    match self.pause_once(queued_at) {
+      Err(err) if self.retry_on_new_connection("PAUSE", started, &err) => self.pause_once(queued_at),
+      result => result,
+    }
+  }
+
+  /// Whether a failed PAUSE / PLAY gets one more try: there is a media session to act on, the
+  /// failure came quickly, and a new connection could be made.
+  fn retry_on_new_connection(&mut self, what: &'static str, started: Instant, err: &Error) -> bool {
+    self.active.is_some() && retry_is_timely(started.elapsed()) && self.reconnect_for_retry(what, err)
+  }
+
+  fn pause_once(&mut self, queued_at: Instant) -> Result<MediaPlayback> {
     let started = Instant::now();
     let Some((transport_id, media_session_id)) =
       self.active.as_ref().map(|s| (s.transport_id.clone(), s.media_session_id))
@@ -2691,7 +2799,7 @@ impl WorkerState {
     };
     self.remote.expect_player(PlayerIntent::Paused, Instant::now());
     let Some(device) = self.device.as_ref() else {
-      return Err(Error::Cast("no active session".to_owned()));
+      return Err(Error::Cast("warm Cast device not connected".to_owned()));
     };
     for dest in ["receiver-0", transport_id.as_str()] {
       if let Err(err) = device.connection.connect(dest) {
@@ -2746,7 +2854,16 @@ impl WorkerState {
       .ok_or_else(|| Error::Cast("media status has no entry for our media session".to_owned()))
   }
 
+  /// Home.io Bridge: one more try on a new connection, as for PAUSE.
   fn handle_play(&mut self) -> Result<()> {
+    let started = Instant::now();
+    match self.play_once() {
+      Err(err) if self.retry_on_new_connection("PLAY", started, &err) => self.play_once(),
+      result => result,
+    }
+  }
+
+  fn play_once(&mut self) -> Result<()> {
     let Some((transport_id, media_session_id)) =
       self.active.as_ref().map(|s| (s.transport_id.clone(), s.media_session_id))
     else {
@@ -2754,7 +2871,7 @@ impl WorkerState {
     };
     self.remote.expect_player(PlayerIntent::Playing, Instant::now());
     let Some(device) = self.device.as_ref() else {
-      return Err(Error::Cast("no active session".to_owned()));
+      return Err(Error::Cast("warm Cast device not connected".to_owned()));
     };
     for dest in ["receiver-0", transport_id.as_str()] {
       if let Err(err) = device.connection.connect(dest) {
@@ -3305,6 +3422,32 @@ mod tests {
       Some(crate::net::CAST_RELAY_IO_TIMEOUT),
       "ShortReadTimeout Drop must restore CAST_RELAY_IO_TIMEOUT"
     );
+  }
+
+  /// A speaker that closes the connection right after it is made, again and again, must not be
+  /// reconnected on every tick; one that held for a while starts the count over.
+  #[test]
+  fn closes_right_after_connecting_are_counted_until_a_connection_holds() {
+    let short = Some(SHORT_LIVED_CONNECTION / 2);
+    assert_eq!(next_short_closes(0, short), 1);
+    assert_eq!(next_short_closes(1, short), 2);
+    assert_eq!(next_short_closes(5, Some(SHORT_LIVED_CONNECTION)), 0, "it held: start over");
+    assert_eq!(next_short_closes(5, None), 0);
+  }
+
+  /// A PAUSE or PLAY that failed late is not sent again: the listener may have moved on.
+  #[test]
+  fn a_command_is_only_retried_when_it_failed_quickly() {
+    assert!(retry_is_timely(Duration::from_millis(50)));
+    assert!(retry_is_timely(TRANSPORT_RETRY_WITHIN));
+    assert!(!retry_is_timely(TRANSPORT_RETRY_WITHIN + Duration::from_millis(1)));
+    assert!(!retry_is_timely(crate::net::CAST_RELAY_IO_TIMEOUT), "a read that ran into the I/O timeout");
+  }
+
+  #[test]
+  fn the_load_wait_is_longer_than_the_other_commands_and_inside_the_op_deadline() {
+    assert!(LOAD_TIMEOUT > COMMAND_TIMEOUT);
+    assert!(LOAD_TIMEOUT < WORKER_OP_DEADLINE);
   }
 
   #[test]

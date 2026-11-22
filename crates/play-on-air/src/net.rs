@@ -526,16 +526,22 @@ fn bridge_tcp_streams(client: TcpStream, remote: TcpStream) {
   let mut client_write = client;
   let mut remote_write = remote;
 
+  // Home.io Bridge: one direction ending ends the whole relay, both sockets shut both ways. A Cast
+  // control connection is no use one way, and the shutdown handle keeps a clone of each socket open:
+  // with only the write half shut, a speaker that had closed its end left `rust_cast` writing PINGs
+  // into a socket nobody read, for days, so the dead connection was never noticed.
   let up = std::thread::spawn(move || {
     if let Err(err) = copy_ignoring_idle_timeouts(&mut client_read, &mut remote_write) {
       tracing::debug!(error = %err, direction = "client->device", "Cast relay copy ended");
     }
-    drop(remote_write.shutdown(Shutdown::Write));
+    drop(remote_write.shutdown(Shutdown::Both));
+    drop(client_read.shutdown(Shutdown::Both));
   });
   if let Err(err) = copy_ignoring_idle_timeouts(&mut remote_read, &mut client_write) {
     tracing::debug!(error = %err, direction = "device->client", "Cast relay copy ended");
   }
-  drop(client_write.shutdown(Shutdown::Write));
+  drop(client_write.shutdown(Shutdown::Both));
+  drop(remote_read.shutdown(Shutdown::Both));
   drop(up.join());
 }
 
@@ -1147,6 +1153,38 @@ tcp   ESTAB      0      0 0.0.0.0:7000 192.168.1.5:40001
     assert_eq!(&got, b"ping-cast");
     drop(client);
     echo_thread.join().expect("echo thread");
+  }
+
+  /// Seen on a Home Assistant box: once a speaker closed its end, the worker went on writing PINGs
+  /// into the relay for days, because the shutdown handle's clones kept the socket open and
+  /// nothing read it. A closed speaker must make the sender's writes fail within a few PINGs.
+  #[test]
+  fn cast_connect_relay_fails_writes_once_the_device_closed() {
+    let device = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind device");
+    let device_port = device.local_addr().expect("device addr").port();
+    let device_thread = std::thread::spawn(move || {
+      let (sock, _) = device.accept().expect("device accept");
+      drop(sock.shutdown(Shutdown::Both));
+    });
+
+    // The shutdown handle stays alive, as it does in the worker's relay slot.
+    let (relay_host, relay_port, _shutdown) = spawn_cast_connect_relay("127.0.0.1", device_port).expect("spawn relay");
+    let mut client = TcpStream::connect((relay_host.as_str(), relay_port)).expect("dial relay");
+    client.set_read_timeout(Some(Duration::from_secs(2))).expect("read timeout");
+    let mut buf = [0_u8; 8];
+    assert_eq!(client.read(&mut buf).expect("read after device close"), 0, "the sender sees the close");
+    device_thread.join().expect("device thread");
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    let mut failed = false;
+    while std::time::Instant::now() < deadline {
+      if client.write_all(b"ping").is_err() {
+        failed = true;
+        break;
+      }
+      std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(failed, "writes to a relay whose device closed must fail, not pile up unread");
   }
 
   fn sa(s: &str) -> SocketAddr {

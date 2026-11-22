@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.2.2
+
+Reliability. Checked by the engine's tests; the changes to speakers' behavior were not heard on real speakers
+before this version was made.
+
+- A speaker's standby connection that the speaker had closed was never noticed and stayed in use. It is now
+  replaced at once (the log says "Cast control connection closed by the speaker; reconnecting"). Before, the
+  first start after it came a moment late, and a pause from the phone during playback could be lost.
+- A start that fails on the speaker's side is tried again, up to two more times. If it still fails, the AirPlay
+  session is ended, so the phone shows the speaker dropped instead of playing into silence.
+- A pause or play that fails is sent once more on a new connection.
+- A speaker kept in time no longer ends up out of time until the add-on is restarted: a slow start is tried
+  again instead of switching to the fallback stream, the fallback is forgotten after 30 minutes, the three
+  corrections of a session come back after five minutes in time, and a speaker the engine had to reload on its
+  own is started again right away instead of sitting silent for about 7 seconds.
+- A speaker waits up to 10 seconds for a start, not 6.
+- From PlayOnAir: a quiet intro or a long silence no longer stalls the speaker; after a skip the speaker no longer
+  plays half a second and then buffers for about 10 seconds; the speaker stops when the phone stops, instead
+  of playing on for about 12 seconds.
+- The log says what a speaker reported when a pause or play on the speaker is passed on to the phone.
+
 ## 0.2.1
 
 - Says when a speaker can't be kept in time: after three tries and a minute still off, the log says so and Home.io

@@ -498,16 +498,15 @@ mod tests {
     assert!(tx.is_closed(), "event intake closed after shutdown");
   }
 
-  /// A registry speaker of `model` on a bridge whose Cast side is [`FakeCast`], and its AirPlay ring.
-  fn retry_harness(
-    device_id: &str,
-    model: &str,
-  ) -> (
+  type RetryHarness = (
     Arc<Bridge>,
     Arc<crate::bridge::test_support::FakeCast>,
     Arc<dyn RingLookup>,
     Arc<PcmRing>,
-  ) {
+  );
+
+  /// A registry speaker of `model` on a bridge whose Cast side is `FakeCast`, and its AirPlay ring.
+  fn retry_harness(device_id: &str, model: &str) -> RetryHarness {
     use crate::bridge::test_support::{FakeCast, started_ring, test_device};
     use crate::cast::CastControl;
     use crate::registry::DeviceRegistry;

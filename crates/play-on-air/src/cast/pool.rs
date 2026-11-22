@@ -96,6 +96,9 @@ enum PlayerIntent {
 struct RemoteTracker {
   intent: Option<PlayerIntent>,
   player_settle_until: Option<Instant>,
+  /// Home.io Bridge: when we last commanded a player state (for the log line of a change that is
+  /// then taken for the listener's).
+  commanded_at: Option<Instant>,
   volume: Option<(f32, bool)>,
   volume_settle_until: Option<Instant>,
   commanded_levels: VecDeque<(f32, Instant)>,
@@ -106,6 +109,7 @@ impl RemoteTracker {
   fn expect_player(&mut self, intent: PlayerIntent, now: Instant) {
     self.intent = Some(intent);
     self.player_settle_until = Some(now + OWN_COMMAND_SETTLE);
+    self.commanded_at = Some(now);
   }
 
   /// Our media session ended: nothing to attribute any more.
@@ -1515,7 +1519,20 @@ impl WorkerState {
     {
       return;
     }
+    let was = self.remote.intent;
     if let Some(kind) = self.remote.observe_player(entry.player_state, Instant::now()) {
+      // Home.io Bridge: a pause "on the device" that nobody made has been seen right after a start.
+      // What the speaker reported, and how long after our own last command, tells the two apart.
+      tracing::info!(
+        device_id = %self.device_id,
+        player_state = ?entry.player_state,
+        idle_reason = ?entry.idle_reason,
+        current_time = ?entry.current_time,
+        we_expected = ?was,
+        since_our_command_ms = self.remote.commanded_at.map(|at| at.elapsed().as_millis()),
+        since_load_ms = self.active_since.map(|at| at.elapsed().as_millis()),
+        "Cast player state not commanded by us"
+      );
       self.emit_remote(kind);
     }
   }

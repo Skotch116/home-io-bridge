@@ -166,6 +166,10 @@ async fn wait_for_prebuffer(device_id: &str, ring: &Arc<PcmRing>, rings: &dyn Ri
 impl Bridge {
   /// `last_try`: no further start follows this one if it fails (see `bridge::worker`). Until then a
   /// speaker kept in time whose FLAC LOAD got no answer fails the start instead of settling for WAV.
+  #[expect(
+    clippy::too_many_arguments,
+    reason = "session start carries the stream's identity, its ring and lookup, the group and the try"
+  )]
   pub(super) async fn handle_session_start(
     self: &Arc<Self>,
     device_id: &str,
@@ -339,7 +343,7 @@ impl Bridge {
     };
     let stream_url = media.stream_url();
 
-    let remembered_wav = self.flac_fallback.lock().contains(device_id);
+    let remembered_wav = self.remembers_wav_fallback(device_id, &device.model);
     let mut egress = select_egress(remembered_wav);
 
     tracing::info!(

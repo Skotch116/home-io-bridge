@@ -15,6 +15,18 @@ use super::state::{DeviceState, EgressKind, PlayingSession};
 /// Decisive rejections inside this window (IDLE recovery, stall) fall back immediately.
 pub(super) const FLAC_FALLBACK_WINDOW: Duration = Duration::from_secs(10);
 
+/// Home.io Bridge: how long the WAV fallback is remembered for a speaker kept in time. Such a model
+/// is known to play FLAC, so what switched it to WAV was passing trouble (a stall, a dropped
+/// connection), and WAV can't be kept in time: remembered for the life of the process, one bad
+/// minute left the speaker out of step with the AirPlay speakers until the bridge was restarted.
+/// Every other model keeps the memory for the life of the process, as before.
+pub(super) const SYNCED_FALLBACK_MEMORY: Duration = Duration::from_secs(30 * 60);
+
+/// Whether a WAV fallback noted `age` ago still holds for a speaker that is or isn't kept in time.
+pub(super) fn fallback_still_remembered(age: Duration, kept_in_time: bool) -> bool {
+  !kept_in_time || age < SYNCED_FALLBACK_MEMORY
+}
+
 /// Two FLAC failure strikes within this window (any session age) → switch LIVE to WAV.
 const FLAC_STRIKE_PAIR_WINDOW: Duration = Duration::from_secs(90);
 
@@ -104,14 +116,30 @@ enum MediaRecoveredPlan {
 
 impl Bridge {
   pub(super) fn remember_flac_fallback(&self, device_id: &str) {
-    let mut set = self.flac_fallback.lock();
-    if set.insert(device_id.to_owned()) {
+    let mut noted = self.flac_fallback.lock();
+    if noted.insert(device_id.to_owned(), Instant::now()).is_none() {
       tracing::info!(
         %device_id,
         "remembering WAV BUFFERED fallback for device (FLAC rejected or early stall)"
       );
     }
-    drop(set);
+    drop(noted);
+  }
+
+  /// Whether the next session of `device_id` starts in WAV. Forgets a fallback that has run out
+  /// for a speaker kept in time ([`SYNCED_FALLBACK_MEMORY`]), so its next session is FLAC again.
+  pub(super) fn remembers_wav_fallback(&self, device_id: &str, model: &str) -> bool {
+    let mut noted = self.flac_fallback.lock();
+    let Some(at) = noted.get(device_id).copied() else {
+      return false;
+    };
+    if fallback_still_remembered(at.elapsed(), crate::audio::sync::is_calibrated(model)) {
+      return true;
+    }
+    let _forgotten = noted.remove(device_id);
+    drop(noted);
+    tracing::info!(%device_id, model, "WAV fallback forgotten for a speaker kept in time; this session tries FLAC again");
+    false
   }
 
   /// Pool re-LOAD recovered media (IDLE ERROR recovery path).
@@ -121,6 +149,11 @@ impl Bridge {
   /// remember process-lifetime fallback for the device.
   pub async fn on_media_recovered(self: &Arc<Self>, cast_key: &str) {
     let owner = self.owner_for_cast_key(cast_key).unwrap_or_else(|| cast_key.to_owned());
+    // Home.io Bridge: the pool re-LOADed with the session's own request. For a speaker kept in time
+    // that request loads paused, and only the timed start sends PLAY: without running it again the
+    // speaker sat silent until the stall watchdog re-LOADed it some 7 s later, which also counted a
+    // second FLAC strike and switched it to WAV.
+    self.note_sync_reload(&owner);
     let Some(plan) = self.plan_media_recovered_flac(&owner) else {
       return;
     };
@@ -273,20 +306,84 @@ mod tests {
   use crate::registry::DeviceRegistry;
 
   #[test]
+  fn a_speaker_kept_in_time_gets_flac_back_after_a_while_and_others_never() {
+    let just_under = SYNCED_FALLBACK_MEMORY.checked_sub(Duration::from_secs(1)).expect("memory > 1s");
+    assert!(fallback_still_remembered(just_under, true));
+    assert!(!fallback_still_remembered(SYNCED_FALLBACK_MEMORY, true), "kept in time: FLAC again");
+    assert!(fallback_still_remembered(SYNCED_FALLBACK_MEMORY * 100, false), "a model that may not play FLAC");
+  }
+
+  #[test]
+  fn the_wav_fallback_runs_out_only_for_a_speaker_kept_in_time() {
+    let bridge = Bridge::new(Arc::new(DeviceRegistry::new()), Arc::new(CastPool::new(None)));
+    let long_ago = Instant::now().checked_sub(SYNCED_FALLBACK_MEMORY * 2).expect("clock far enough from zero");
+    for id in ["mini", "tv"] {
+      let _new = bridge.flac_fallback.lock().insert(id.to_owned(), long_ago);
+    }
+    assert!(bridge.remembers_wav_fallback("tv", "Some TV"), "kept for the life of the process");
+    assert!(!bridge.remembers_wav_fallback("mini", "Google Nest Mini"));
+    assert!(!bridge.flac_fallback.lock().contains_key("mini"), "forgotten, so a new failure is noted anew");
+
+    bridge.remember_flac_fallback("mini");
+    assert!(bridge.remembers_wav_fallback("mini", "Google Nest Mini"), "a fresh fallback holds");
+    assert!(!bridge.remembers_wav_fallback("other", "Google Nest Mini"), "nothing noted");
+  }
+
+  #[test]
   fn flac_fallback_memory_skips_flac_next_select() {
     let bridge = Bridge::new(Arc::new(DeviceRegistry::new()), Arc::new(CastPool::new(None)));
     assert_eq!(
-      select_egress(bridge.flac_fallback.lock().contains("nest")),
+      select_egress(bridge.flac_fallback.lock().contains_key("nest")),
       EgressKind::FlacLive
     );
     bridge.remember_flac_fallback("nest");
     assert_eq!(
-      select_egress(bridge.flac_fallback.lock().contains("nest")),
+      select_egress(bridge.flac_fallback.lock().contains_key("nest")),
       EgressKind::WavBuffered
     );
     // Idempotent remember.
     bridge.remember_flac_fallback("nest");
     assert_eq!(bridge.flac_fallback.lock().len(), 1);
+  }
+
+  /// The pool's own re-LOAD of a speaker kept in time loads it paused. The timed start has to run
+  /// again to send PLAY: seen from here as the session's load epoch moving on.
+  #[tokio::test]
+  async fn media_recovered_runs_the_timed_start_again_for_a_speaker_kept_in_time() {
+    use crate::audio::sync::{SyncTimeline, resolve_sync};
+    use crate::bridge::sync::{SyncAttach, SyncSession};
+    use std::sync::atomic::Ordering;
+
+    const DEV: &str = "dev-timed-recov";
+    let pool: Arc<dyn CastControl> = Arc::new(CastPool::new(None));
+    let bridge = Arc::new(Bridge::new(Arc::new(DeviceRegistry::new()), Arc::clone(&pool)));
+    let media = MediaServer::start("127.0.0.1").await.expect("media");
+    let mut playing = test_playing_session(media, DEV, Arc::clone(&pool), Arc::new(PcmRing::new(2, 64)));
+    playing.egress = EgressKind::FlacLive;
+    // Past the early window, so this recovery is a first strike and the session stays FLAC.
+    playing.started_at = Instant::now().checked_sub(FLAC_FALLBACK_WINDOW * 2).expect("clock far enough from zero");
+    let attach = SyncAttach {
+      timeline: Arc::new(SyncTimeline::new(48_000, DEV, "Google Nest Mini")),
+      params: resolve_sync("Google Nest Mini").expect("a model kept in time"),
+    };
+    let sync = Arc::new(SyncSession::from_attach(
+      attach,
+      DEV,
+      48_000,
+      Arc::clone(&pool),
+      Arc::clone(&playing.route),
+      Arc::clone(&playing.session_alive),
+      Arc::clone(&playing.playback_paused),
+      Arc::clone(&playing.transport_flight),
+    ));
+    playing.sync = Some(Arc::clone(&sync));
+    insert_playing(&bridge, DEV, 1, playing);
+    let before = sync.load_epoch.load(Ordering::Acquire);
+
+    bridge.on_media_recovered(DEV).await;
+
+    assert_eq!(sync.load_epoch.load(Ordering::Acquire), before + 1, "the timed start runs again");
+    bridge.handle_session_end(DEV).await;
   }
 
   #[tokio::test]
@@ -302,7 +399,7 @@ mod tests {
     bridge.on_media_recovered("dev-recov").await;
 
     assert!(
-      bridge.flac_fallback.lock().contains("dev-recov"),
+      bridge.flac_fallback.lock().contains_key("dev-recov"),
       "early media_recovered must remember WAV fallback"
     );
     {
@@ -331,7 +428,7 @@ mod tests {
 
     bridge.on_media_recovered("dev-late").await;
 
-    assert!(!bridge.flac_fallback.lock().contains("dev-late"));
+    assert!(!bridge.flac_fallback.lock().contains_key("dev-late"));
     {
       let devices = bridge.devices.lock();
       let DeviceState::Playing { session: live, .. } = &devices.get("dev-late").expect("slot").state else {
@@ -363,7 +460,7 @@ mod tests {
     bridge.on_media_recovered("dev-late2").await;
 
     assert!(
-      bridge.flac_fallback.lock().contains("dev-late2"),
+      bridge.flac_fallback.lock().contains_key("dev-late2"),
       "two late media_recovered strikes must remember WAV fallback"
     );
     {
@@ -411,7 +508,7 @@ mod tests {
     // switch_playing_to_wav returns re-LOAD success; without a Cast worker that is false, but
     // egress still flips under the lock (same as early media_recovered tests).
     let _reload_ok = bridge.switch_playing_to_wav("dev-mixed", 1).await;
-    assert!(bridge.flac_fallback.lock().contains("dev-mixed"));
+    assert!(bridge.flac_fallback.lock().contains_key("dev-mixed"));
     {
       let devices = bridge.devices.lock();
       let DeviceState::Playing { session: live, .. } = &devices.get("dev-mixed").expect("slot").state else {

@@ -219,7 +219,8 @@ impl CastControl for FakeCast {
     if let Some(LoadHook(hook)) = pending {
       hook();
     }
-    if let Some(err) = self.load_errors.lock().pop_front() {
+    let failing = self.load_errors.lock().pop_front();
+    if let Some(err) = failing {
       return Err(err);
     }
     Ok(crate::cast::MediaSessionRef {

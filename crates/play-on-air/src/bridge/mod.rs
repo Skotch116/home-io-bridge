@@ -16,7 +16,7 @@
 //! metadata to Cast, Cast-side play / pause / volume to the sender), `group` (AirPlay
 //! multi-select played as one Google Cast multizone session).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -63,8 +63,9 @@ pub struct Bridge {
   airplay: Option<Arc<AirPlayManager>>,
   /// Per-device generation-stamped state machine.
   devices: Mutex<HashMap<String, DeviceSlot>>,
-  /// Devices that rejected FLAC this process lifetime (always use WAV BUFFERED).
-  flac_fallback: Mutex<HashSet<String>>,
+  /// Devices that rejected FLAC (use WAV BUFFERED), and when that was noted. Kept for the process
+  /// lifetime, except for a speaker kept in time (Home.io Bridge, `bridge::fallback`).
+  flac_fallback: Mutex<HashMap<String, std::time::Instant>>,
   /// Optional barrier waited once at the start of each `handle_session_start`.
   ///
   /// Tests use this to prove multi-device starts run concurrently (no HOL blocking).
@@ -125,7 +126,7 @@ impl Bridge {
       cast_pool,
       airplay: None,
       devices: Mutex::new(HashMap::new()),
-      flac_fallback: Mutex::new(HashSet::new()),
+      flac_fallback: Mutex::new(HashMap::new()),
       start_barrier: Mutex::new(None),
       shutdown: watch::Sender::new(false),
       detached: Mutex::new(JoinSet::new()),

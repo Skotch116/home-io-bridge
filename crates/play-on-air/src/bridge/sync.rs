@@ -27,6 +27,10 @@ const STEP_AFTER_TICKS: u32 = 3;
 /// still off after that is off for a reason a step can't fix, and the slew is left to it.
 const STEP_SPACING: Duration = Duration::from_secs(20);
 const STEP_LIMIT: u32 = 3;
+/// After this many drift ticks in a row inside the step threshold (five minutes in time) the steps
+/// used so far are given back. They never came back before, so a long session that had needed three
+/// (three Wi-Fi hiccups in an evening) could only slew from then on, and was listed as out of time.
+const STEPS_BACK_AFTER_TICKS: u32 = 300;
 /// With the steps used up, an error still past the threshold on this many ticks in a row (a minute, more
 /// than the slew needs for anything it can close) means this speaker is not being kept in time: the
 /// owner is told (`late.txt`) until it is back.
@@ -75,6 +79,8 @@ pub(super) struct SyncSession {
   over: AtomicU32,
   /// Steps asked for so far, and when the last one was.
   stepped: parking_lot::Mutex<(u32, Option<Instant>)>,
+  /// Drift ticks in a row inside the step threshold.
+  in_time: AtomicU32,
   /// Listed in `late.txt` as out of time.
   late: AtomicBool,
 }
@@ -133,6 +139,7 @@ impl SyncSession {
       step: parking_lot::Mutex::new(None),
       over: AtomicU32::new(0),
       stepped: parking_lot::Mutex::new((0, None)),
+      in_time: AtomicU32::new(0),
       late: AtomicBool::new(false),
     }
   }
@@ -176,8 +183,19 @@ impl SyncSession {
     if error_secs.abs() <= crate::audio::sync::DRIFT_STEP_SECS {
       self.over.store(0, Ordering::Release);
       self.set_late(false);
+      let in_time = self.in_time.fetch_add(1, Ordering::AcqRel).saturating_add(1);
+      if in_time == STEPS_BACK_AFTER_TICKS {
+        let mut stepped = self.stepped.lock();
+        let used = stepped.0;
+        stepped.0 = steps_left_used(used, in_time);
+        drop(stepped);
+        if used > 0 {
+          tracing::info!(device = %self.device_id, used, "sync: in time for five minutes; steps given back");
+        }
+      }
       return false;
     }
+    self.in_time.store(0, Ordering::Release);
     let over = self.over.fetch_add(1, Ordering::AcqRel) + 1;
     if over < STEP_AFTER_TICKS {
       return false;
@@ -489,6 +507,11 @@ async fn drift_tick(sync: &SyncSession, ema: Option<f64>) -> Option<f64> {
   Some(smoothed)
 }
 
+/// Steps counted as used after `in_time_ticks` drift ticks in a row in time: none once that is five minutes.
+const fn steps_left_used(used: u32, in_time_ticks: u32) -> u32 {
+  if in_time_ticks >= STEPS_BACK_AFTER_TICKS { 0 } else { used }
+}
+
 /// Out of time for good, as far as this session can tell: no step left and a minute past the threshold.
 fn is_late(over: u32, steps: u32) -> bool {
   steps >= STEP_LIMIT && over >= LATE_AFTER_TICKS
@@ -547,6 +570,13 @@ mod tests {
     assert!(!is_late(LATE_AFTER_TICKS, STEP_LIMIT - 1), "a step can still bring it back");
     assert!(!is_late(LATE_AFTER_TICKS - 1, STEP_LIMIT), "the slew may still be closing it");
     assert!(is_late(LATE_AFTER_TICKS, STEP_LIMIT));
+  }
+
+  #[test]
+  fn steps_come_back_after_five_minutes_in_time() {
+    assert_eq!(steps_left_used(STEP_LIMIT, STEPS_BACK_AFTER_TICKS - 1), STEP_LIMIT, "not yet");
+    assert_eq!(steps_left_used(STEP_LIMIT, STEPS_BACK_AFTER_TICKS), 0);
+    assert_eq!(steps_left_used(0, STEPS_BACK_AFTER_TICKS), 0);
   }
 
   #[test]

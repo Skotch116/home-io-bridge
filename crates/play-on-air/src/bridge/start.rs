@@ -62,6 +62,12 @@ pub(super) async fn wait_for_start_lead(ring: &PcmRing, sample_rate: u32, keep_w
   }
 }
 
+/// Home.io Bridge: whether a failed FLAC LOAD fails the start instead of falling back to WAV:
+/// the speaker did not reject FLAC (`rejected`), it is one kept in time, and another start follows.
+const fn wav_waits_for_last_try(rejected: bool, kept_in_time: bool, last_try: bool) -> bool {
+  !rejected && kept_in_time && !last_try
+}
+
 /// Max prebuffer poll iterations (160 × 50 ms = 8 s). Real-time PCM reaches one block within
 /// tens of milliseconds, so running out means the sender paused or stopped before audio flowed.
 const PREBUFFER_POLLS: u32 = 160;
@@ -158,6 +164,8 @@ async fn wait_for_prebuffer(device_id: &str, ring: &Arc<PcmRing>, rings: &dyn Ri
 }
 
 impl Bridge {
+  /// `last_try`: no further start follows this one if it fails (see `bridge::worker`). Until then a
+  /// speaker kept in time whose FLAC LOAD got no answer fails the start instead of settling for WAV.
   pub(super) async fn handle_session_start(
     self: &Arc<Self>,
     device_id: &str,
@@ -165,6 +173,7 @@ impl Bridge {
     ring: Arc<PcmRing>,
     airplay_group: Option<String>,
     rings: Arc<dyn RingLookup>,
+    last_try: bool,
   ) -> Result<()> {
     let is_current = |expected: &Arc<PcmRing>| -> bool {
       rings.ring_for(device_id).is_some_and(|current| Arc::ptr_eq(&current, expected))
@@ -262,7 +271,7 @@ impl Bridge {
     }
 
     let result = self
-      .start_cast_session(device_id, generation, &device, ring, fmt, route, group)
+      .start_cast_session(device_id, generation, &device, ring, fmt, route, group, last_try)
       .await;
     // Disarm only when this generation is live Playing (install kept the session).
     // clear_starting_if is a no-op on Playing; keep explicit error clears + guard for panics.
@@ -318,6 +327,7 @@ impl Bridge {
     fmt: StreamFormat,
     route: Arc<CastRoute>,
     group: Option<String>,
+    last_try: bool,
   ) -> Result<()> {
     let host = advertise_host_for_peer(&device.host);
     let media = match MediaServer::start(&host).await {
@@ -358,6 +368,7 @@ impl Bridge {
         &stream_url,
         &mut egress,
         &mut sync_attach,
+        last_try,
       )
       .await;
 
@@ -433,6 +444,7 @@ impl Bridge {
     stream_url: &str,
     egress: &mut EgressKind,
     sync_out: &mut Option<SyncAttach>,
+    last_try: bool,
   ) -> Result<crate::cast::MediaSessionRef> {
     let track = self.load_track(device_id, media, &device.name);
     match *egress {
@@ -468,6 +480,18 @@ impl Bridge {
             // Always WAV for this session. Process-lifetime memory only on decisive rejection
             // (not timeout / disconnect / no worker) so transport blips do not poison FLAC forever.
             let remember = !is_transport_shaped_cast_error(&flac_err);
+            // Home.io Bridge: a speaker kept in time is known to play FLAC. When its LOAD only got no
+            // answer (slow, or the connection dropped), WAV would not fix that and can't be kept
+            // in time: fail this start so it is tried again in FLAC, while a try is left.
+            if wav_waits_for_last_try(remember, syncing.is_some(), last_try) {
+              tracing::warn!(
+                %device_id,
+                generation,
+                error = %flac_err,
+                "Cast FLAC LIVE load got no answer; not settling for WAV while the start can be tried again"
+              );
+              return Err(flac_err);
+            }
             tracing::warn!(
               %device_id,
               generation,
@@ -728,7 +752,7 @@ mod tests {
 
     let start = Instant::now();
     bridge
-      .handle_session_start("dev-1", 48_000, event_ring, None, rings)
+      .handle_session_start("dev-1", 48_000, event_ring, None, rings, true)
       .await
       .expect("stale start skips cleanly");
     assert!(
@@ -745,7 +769,7 @@ mod tests {
     let rings: Arc<dyn RingLookup> = Arc::new(FixedRingLookup { current: None });
 
     bridge
-      .handle_session_start("dev-1", 48_000, event_ring, None, rings)
+      .handle_session_start("dev-1", 48_000, event_ring, None, rings, true)
       .await
       .expect("withdrawn receiver skips cleanly");
     assert!(!bridge.has_session("dev-1"));
@@ -757,7 +781,7 @@ mod tests {
     let ring = Arc::new(PcmRing::new(2, 64));
     let rings: Arc<dyn RingLookup> = Arc::new(FixedRingLookup { current: Some(Arc::clone(&ring)) });
     let err = bridge
-      .handle_session_start("missing-dev", 48_000, ring, None, rings)
+      .handle_session_start("missing-dev", 48_000, ring, None, rings, true)
       .await
       .expect_err("unknown device must fail");
     assert!(err.to_string().contains("unknown device"), "unexpected error: {err}");
@@ -784,7 +808,7 @@ mod tests {
     let ring = Arc::new(PcmRing::new(2, PREBUFFER_FRAMES * 2));
     let rings: Arc<dyn RingLookup> = Arc::new(FixedRingLookup { current: Some(Arc::clone(&ring)) });
     let err = bridge
-      .handle_session_start("dev-prebuf", 48_000, ring, None, rings)
+      .handle_session_start("dev-prebuf", 48_000, ring, None, rings, true)
       .await
       .expect_err("empty ring must prebuffer-timeout");
     let msg = err.to_string();

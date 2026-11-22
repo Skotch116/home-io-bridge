@@ -112,17 +112,6 @@ impl RingLookup for FixedRingLookup {
   }
 }
 
-/// Ring lookup keyed by device id.
-pub(super) struct MapRingLookup {
-  pub(super) rings: HashMap<String, Arc<PcmRing>>,
-}
-
-impl RingLookup for MapRingLookup {
-  fn ring_for(&self, device_id: &str) -> Option<Arc<PcmRing>> {
-    self.rings.get(device_id).map(Arc::clone)
-  }
-}
-
 /// A Cast command the bridge issued to [`FakeCast`].
 #[derive(Debug, Clone, PartialEq)]
 pub(super) enum CastCall {
@@ -176,6 +165,8 @@ pub(super) struct FakeCast {
   members: Mutex<HashMap<String, Vec<crate::cast::MultizoneMember>>>,
   /// Every `set_volume` as `(key, level)`, in call order.
   volumes: Mutex<Vec<(String, f32)>>,
+  /// Errors the next LOADs answer with, in order; an empty queue loads successfully.
+  load_errors: Mutex<std::collections::VecDeque<crate::error::Error>>,
 }
 
 impl FakeCast {
@@ -186,6 +177,11 @@ impl FakeCast {
   /// Answer the next `move_session` with `result` (an adopt that fails on the new host).
   pub(super) fn answer_move(&self, result: crate::error::Result<()>) {
     self.moves.lock().push_back(result);
+  }
+
+  /// Fail the next LOAD with `err` (queued: one call per failing LOAD).
+  pub(super) fn fail_next_load(&self, err: crate::error::Error) {
+    self.load_errors.lock().push_back(err);
   }
 
   /// Run `hook` during the next LOAD, before it returns.
@@ -222,6 +218,9 @@ impl CastControl for FakeCast {
     let pending = self.load_hook.lock().take();
     if let Some(LoadHook(hook)) = pending {
       hook();
+    }
+    if let Some(err) = self.load_errors.lock().pop_front() {
+      return Err(err);
     }
     Ok(crate::cast::MediaSessionRef {
       transport_id: format!("transport-{key}"),

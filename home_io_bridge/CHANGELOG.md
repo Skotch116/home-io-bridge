@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.2.3
+
+A speaker no longer drops out of the AirPlay list when it stops answering for a moment. Checked by the engine's
+tests; not yet seen on real speakers before this version was made.
+
+- A speaker that stops answering (a restart, a moment off Wi-Fi) stays in the AirPlay list for 5 minutes while the
+  add-on keeps reconnecting. Before, it was taken out of the list a few seconds after it stopped answering.
+- A speaker that was taken out is tried again at its last address every 30 seconds, and is back in the AirPlay list
+  as soon as it answers (the log says "departed Chromecast answers again; back in AirPlay"). Before, it came back
+  only when it next announced itself on the network, which took over half an hour.
+
 ## 0.2.2
 
 Reliability. Checked by the engine's tests; the changes to speakers' behavior were not heard on real speakers

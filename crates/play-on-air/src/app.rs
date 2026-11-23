@@ -44,6 +44,39 @@ struct MaintainGuards {
   known_ids: Mutex<HashSet<String>>,
   /// Device ids with an outstanding `spawn_blocking` volume seed (not merely timed-out await).
   volume_seed_inflight: Mutex<HashSet<String>>,
+  /// Home.io Bridge: when each speaker's warm Cast connection was first seen unreachable (cleared when it answers).
+  unreachable_since: Mutex<HashMap<String, Instant>>,
+  /// Home.io Bridge: speakers withdrawn as stale, knocked on at their last address until they answer again.
+  departed: Mutex<HashMap<String, Departed>>,
+}
+
+/// Home.io Bridge: a speaker withdrawn because it stopped answering, kept so it can come back as soon as it answers
+/// at its last address, without waiting for its next mDNS announcement (a Nest Hub was gone 36 minutes that way).
+#[derive(Debug, Clone)]
+struct Departed {
+  device: Device,
+  since: Instant,
+  last_knock: Option<Instant>,
+  knocking: bool,
+}
+
+/// Home.io Bridge: how long a speaker may be unreachable before its AirPlay receiver is withdrawn (a speaker that
+/// restarts, or drops off Wi-Fi for a moment, stays in the AirPlay list).
+const UNREACHABLE_GRACE: Duration = Duration::from_secs(300);
+/// Home.io Bridge: how often a departed speaker's last address is tried, and for how long after it left.
+const KNOCK_EVERY: Duration = Duration::from_secs(30);
+const KNOCK_FOR: Duration = Duration::from_secs(24 * 3600);
+
+/// Home.io Bridge: whether an unreachable speaker has been unreachable long enough to withdraw.
+fn unreachable_long_enough(first_unreachable: Instant, now: Instant, grace: Duration) -> bool {
+  now.saturating_duration_since(first_unreachable) >= grace
+}
+
+/// Home.io Bridge: whether a departed speaker is due a knock at its last address.
+fn knock_due(d: &Departed, now: Instant) -> bool {
+  !d.knocking
+    && now.saturating_duration_since(d.since) < KNOCK_FOR
+    && d.last_knock.is_none_or(|t| now.saturating_duration_since(t) >= KNOCK_EVERY)
 }
 
 /// Top-level runtime owning shared state.
@@ -298,6 +331,7 @@ fn spawn_maintain_loop(
       if *shutdown.borrow() {
         break;
       }
+      knock_departed(&registry, &guards);
       if let Err(err) = maintain_airplay(&registry, &config, &airplay, &cast_pool, &bridge, &guards).await {
         tracing::error!(error = %err, "AirPlay maintain loop error");
       }
@@ -421,11 +455,18 @@ async fn apply_stale_expiry(
   // worker reports it unreachable (a healthy Cast speaker keeps its AirPlay ad).
   // Home.io Bridge: the Linux rule on every system. On a Mac the speakers were dropped 10 minutes after they
   // were last seen announcing, though they were still there and reachable.
+  // Home.io Bridge: an unreachable speaker also gets UNREACHABLE_GRACE before it leaves (the Kitchen Display was
+  // withdrawn 6 s after its Cast connection closed); answering again clears the clock.
+  let now = Instant::now();
+  guards.unreachable_since.lock().retain(|id, _| !cast_pool.is_reachable(id));
   let expired = {
     use crate::registry::should_leave_linux_stale;
     registry.expire_stale_where(DEFAULT_STALE_TTL, |dev| {
       let cast_reachable = cast_pool.is_reachable(&dev.id);
-      let leave = should_leave_linux_stale(true, cast_reachable);
+      let leave = should_leave_linux_stale(true, cast_reachable) && {
+        let first = *guards.unreachable_since.lock().entry(dev.id.clone()).or_insert(now);
+        unreachable_long_enough(first, now, UNREACHABLE_GRACE)
+      };
       if !leave {
         tracing::debug!(
           id = %dev.id,
@@ -460,6 +501,45 @@ async fn apply_stale_expiry(
     remove_cast_worker(cast_pool, &dev.id).await;
     let _ = guards.session_blocked.lock().remove(&dev.id);
     let _ = guards.not_desired_since.lock().remove(&dev.id);
+    let _ = guards.unreachable_since.lock().remove(&dev.id);
+    drop(guards.departed.lock().insert(dev.id.clone(), Departed { device: dev.clone(), since: Instant::now(), last_knock: None, knocking: false }));
+  }
+}
+
+/// Home.io Bridge: knock on each departed speaker's last address; one that answers is put back as if it had just
+/// announced itself (the maintain loop then advertises it again). One that announces itself is dropped from the list.
+fn knock_departed(registry: &Arc<DeviceRegistry>, guards: &Arc<MaintainGuards>) {
+  let now = Instant::now();
+  let due: Vec<Departed> = {
+    let mut departed = guards.departed.lock();
+    departed.retain(|id, d| registry.get(id).is_none() && now.saturating_duration_since(d.since) < KNOCK_FOR);
+    departed
+      .values_mut()
+      .filter(|d| knock_due(d, now))
+      .map(|d| {
+        d.knocking = true;
+        d.last_knock = Some(now);
+        d.clone()
+      })
+      .collect()
+  };
+  for d in due {
+    let registry = Arc::clone(registry);
+    let guards = Arc::clone(guards);
+    drop(tokio::task::spawn_blocking(move || {
+      let answered = crate::net::tcp_connect_cast_bound(&d.device.host, d.device.port).is_ok();
+      let mut departed = guards.departed.lock();
+      if answered && departed.remove(&d.device.id).is_some() {
+        let mut back = d.device.clone();
+        back.last_seen = Instant::now();
+        back.pending_leave_deadline = None;
+        back.pending_leave_since = None;
+        tracing::info!(id = %back.id, name = %back.name, away_s = d.since.elapsed().as_secs(), "departed Chromecast answers again; back in AirPlay");
+        let _ = registry.appear(back);
+      } else if let Some(e) = departed.get_mut(&d.device.id) {
+        e.knocking = false;
+      }
+    }));
   }
 }
 
@@ -717,6 +797,77 @@ async fn remove_cast_worker(cast_pool: &Arc<CastPool>, device_id: &str) {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn unreachable_speaker_waits_out_the_grace() {
+    let first = Instant::now();
+    assert!(!unreachable_long_enough(first, first + Duration::from_secs(6), UNREACHABLE_GRACE));
+    assert!(!unreachable_long_enough(first, first + UNREACHABLE_GRACE - Duration::from_secs(1), UNREACHABLE_GRACE));
+    assert!(unreachable_long_enough(first, first + UNREACHABLE_GRACE, UNREACHABLE_GRACE));
+  }
+
+  #[test]
+  fn departed_speaker_knocks_on_schedule() {
+    let since = Instant::now();
+    let dev = Device::new("hub", "Kitchen Display", "127.0.0.1", "hub.local", 8009, "Google-Nest-Hub-x");
+    let mut d = Departed { device: dev, since, last_knock: None, knocking: false };
+    assert!(knock_due(&d, since), "first knock right away");
+    d.knocking = true;
+    assert!(!knock_due(&d, since + KNOCK_EVERY), "one knock at a time");
+    d.knocking = false;
+    d.last_knock = Some(since);
+    assert!(!knock_due(&d, since + Duration::from_secs(10)));
+    assert!(knock_due(&d, since + KNOCK_EVERY));
+    assert!(!knock_due(&d, since + KNOCK_FOR), "gives up after a day");
+  }
+
+  #[tokio::test]
+  async fn departed_speaker_that_answers_comes_back() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let registry = Arc::new(DeviceRegistry::new());
+    let guards = Arc::new(MaintainGuards::default());
+    let dev = Device::new("hub", "Kitchen Display", "127.0.0.1", "hub.local", port, "Google-Nest-Hub-x");
+    drop(guards.departed.lock().insert(
+      "hub".into(),
+      Departed { device: dev, since: Instant::now(), last_knock: None, knocking: false },
+    ));
+    knock_departed(&registry, &guards);
+    for _ in 0..50 {
+      if registry.get("hub").is_some() {
+        break;
+      }
+      sleep(Duration::from_millis(100)).await;
+    }
+    assert!(registry.get("hub").is_some(), "a speaker answering at its last address is back");
+    assert!(guards.departed.lock().is_empty());
+  }
+
+  #[tokio::test]
+  async fn departed_speaker_that_does_not_answer_stays_out() {
+    let port = {
+      let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+      l.local_addr().unwrap().port()
+    }; // (closed again: nothing answers there)
+    let registry = Arc::new(DeviceRegistry::new());
+    let guards = Arc::new(MaintainGuards::default());
+    let dev = Device::new("hub", "Kitchen Display", "127.0.0.1", "hub.local", port, "Google-Nest-Hub-x");
+    drop(guards.departed.lock().insert(
+      "hub".into(),
+      Departed { device: dev, since: Instant::now(), last_knock: None, knocking: false },
+    ));
+    knock_departed(&registry, &guards);
+    for _ in 0..50 {
+      if !guards.departed.lock().get("hub").is_some_and(|d| d.knocking) {
+        break;
+      }
+      sleep(Duration::from_millis(100)).await;
+    }
+    assert!(registry.get("hub").is_none());
+    let departed = guards.departed.lock();
+    let d = departed.get("hub").expect("still waiting to come back");
+    assert!(!d.knocking && d.last_knock.is_some());
+  }
 
   #[test]
   fn withdraw_decision_defers_live_session() {
